@@ -1,0 +1,3705 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>Multiverse Drone Simulator MVP3 | XR Blocks</title>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <link
+      type="text/css"
+      rel="stylesheet"
+      href="https://xrblocks.github.io/css/xr.css"
+    />
+    <script>
+      window.litDisableBundleWarning = true;
+    </script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/",
+          "troika-three-text": "https://cdn.jsdelivr.net/gh/protectwise/troika@028b81cf308f0f22e5aa8e78196be56ec1997af5/packages/troika-three-text/src/index.js",
+          "troika-three-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-three-utils/src/index.js",
+          "troika-worker-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-worker-utils/src/index.js",
+          "bidi-js": "https://esm.sh/bidi-js@%5E1.0.2?target=es2022",
+          "webgl-sdf-generator": "https://esm.sh/webgl-sdf-generator@1.1.1/es2022/webgl-sdf-generator.mjs",
+          "lit": "https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js",
+          "lit/": "https://esm.run/lit@3/",
+          "xrblocks": "https://cdn.jsdelivr.net/npm/xrblocks@0.12.0/build/xrblocks.js",
+          "xrblocks/addons/": "https://cdn.jsdelivr.net/npm/xrblocks@0.12.0/build/addons/"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <script type="module">
+      import "xrblocks/addons/simulator/SimulatorAddons.js";
+      import * as THREE from "three";
+      import * as xb from "xrblocks";
+      import { RainParticles } from "./RainParticles.js";
+      import { VRWorldManager } from "./VRWorldManager.js";
+      import { PaintSplash } from "./PaintSplash.js";
+      import { palette } from "xrblocks/addons/utils/Palette.js";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+      // Global unhandled rejection guard to gracefully catch redundant WebXR session initialization calls
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason?.message || event.reason?.toString() || "";
+        if (reason.includes("Session already started")) {
+          event.preventDefault(); // Suppresses the unhandled promise rejection error overlay
+          console.warn(
+            "Safely caught and suppressed redundant WebXR session start event.",
+          );
+        }
+      });
+
+      const LEFT_HAND_INDEX = 0;
+      const RIGHT_HAND_INDEX = 1;
+
+      /**
+       * Generative Flight-to-Techno Sequencer
+       */
+      class TechnoDroneSynth {
+        constructor() {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          this.ctx = new AudioContext();
+
+          this.compressor = this.ctx.createDynamicsCompressor();
+          this.compressor.threshold.value = -24;
+          this.compressor.knee.value = 10;
+          this.compressor.ratio.value = 12;
+          this.compressor.attack.value = 0.003;
+          this.compressor.release.value = 0.25;
+
+          this.masterGain = this.ctx.createGain();
+          this.masterGain.gain.value = 0.5;
+
+          this.analyser = this.ctx.createAnalyser();
+          this.analyser.fftSize = 128;
+          this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
+          this.globalFilter = this.ctx.createBiquadFilter();
+          this.globalFilter.type = "lowpass";
+          this.globalFilter.frequency.value = 20000;
+
+          this.panner = this.ctx.createPanner();
+          this.panner.panningModel = "HRTF";
+          this.panner.distanceModel = "inverse";
+          this.panner.refDistance = 1;
+          this.panner.maxDistance = 10000;
+          this.panner.rolloffFactor = 1.2;
+
+          this.masterGain.connect(this.compressor);
+          this.compressor.connect(this.globalFilter);
+          this.globalFilter.connect(this.analyser);
+          this.analyser.connect(this.panner);
+          this.panner.connect(this.ctx.destination);
+
+          this.isPlaying = false;
+          this.currentStep = 0;
+          this.nextNoteTime = 0.0;
+          this.lookahead = 25.0;
+          this.scheduleAheadTime = 0.1;
+
+          this.bpm = 110;
+          this.filterCutoff = 400;
+          this.hatDecay = 0.05;
+          this.glitchFactor = 0.0;
+          this.soundMode = "xr";
+
+          this.bassScale = [65.41, 77.78, 87.31, 98.0, 116.54];
+        }
+
+        resume() {
+          if (this.ctx.state === "suspended") {
+            this.ctx
+              .resume()
+              .catch((e) => console.warn("Audio context resume blocked:", e));
+          }
+          if (!this.isPlaying) {
+            this.isPlaying = true;
+            this.nextNoteTime = this.ctx.currentTime + 0.05;
+            this.scheduler();
+          }
+        }
+
+        scheduler() {
+          while (
+            this.nextNoteTime <
+            this.ctx.currentTime + this.scheduleAheadTime
+          ) {
+            this.scheduleNote(this.currentStep, this.nextNoteTime);
+            this.nextNote();
+          }
+          if (this.isPlaying) {
+            setTimeout(() => this.scheduler(), this.lookahead);
+          }
+        }
+
+        nextNote() {
+          const secondsPerBeat = 60.0 / this.bpm;
+          this.nextNoteTime += 0.25 * secondsPerBeat;
+          this.currentStep++;
+          if (this.currentStep >= 16) this.currentStep = 0;
+        }
+
+        scheduleNote(stepNumber, time) {
+          if (this.soundMode === "greek") {
+            this.scheduleGreekNote(stepNumber, time);
+          } else if (this.soundMode === "temple") {
+            this.scheduleTempleNote(stepNumber, time);
+          } else {
+            // Original XR mode (Techno Drone)
+            if (
+              this.glitchFactor > 0.1 &&
+              Math.random() < this.glitchFactor * 0.3
+            ) {
+              time += (Math.random() - 0.5) * 0.08;
+            }
+
+            if (stepNumber % 4 === 0) this.playKick(time);
+            if (stepNumber % 4 === 2) this.playHat(time, this.hatDecay);
+
+            if ([0, 3, 7, 10, 12, 14].includes(stepNumber)) {
+              const noteFreq =
+                this.bassScale[Math.floor(Math.random() * this.bassScale.length)];
+              this.playAcidBass(time, noteFreq);
+            }
+
+            if (
+              this.glitchFactor > 0.25 &&
+              Math.random() < this.glitchFactor * 0.35
+            ) {
+              this.playGlitchNoise(time + 0.05);
+            }
+          }
+        }
+
+        scheduleGreekNote(stepNumber, time) {
+          // Epic Dark-Ambient/Industrial Gothic Ritual Techno
+          if (stepNumber % 4 === 0) {
+            this.playHeavyDrum(time);
+          } else if (stepNumber % 4 === 2 && Math.random() < 0.6) {
+            this.playGreekMetalRattle(time);
+          }
+
+          // Slow ominous bassline drone
+          if (stepNumber % 4 === 0) {
+            const noteFreq = this.bassScale[Math.floor(Math.random() * this.bassScale.length)];
+            this.playGreekBass(time, noteFreq);
+          }
+
+          // Random ambient eerie screaming metallic wind whispers
+          if (stepNumber % 8 === 4 && Math.random() < 0.25) {
+            this.playEerieScreech(time);
+          }
+        }
+
+        scheduleTempleNote(stepNumber, time) {
+          // Meditative crystalline bells, ambient warm chords, and subtle celestial pulses
+          if (stepNumber % 8 === 0) {
+            this.playWarmHeartbeat(time);
+          }
+
+          // Pentatonic chime clusters
+          if ([0, 2, 4, 6, 8, 10, 12, 14].includes(stepNumber) && Math.random() < 0.65) {
+            const pitches = [440.0, 493.88, 554.37, 659.25, 739.99, 880.0, 987.77, 1108.73];
+            const pitch = pitches[Math.floor(Math.random() * pitches.length)];
+            this.playTempleChime(time, pitch);
+          }
+
+          // Deep cosmic swell
+          if (stepNumber === 0) {
+            this.playCosmicSwell(time);
+          }
+        }
+
+        playKick(time) {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.frequency.setValueAtTime(150, time);
+          osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.5);
+          gain.gain.setValueAtTime(1.0, time);
+          gain.gain.exponentialRampToValueAtTime(0.01, time + 0.5);
+          osc.connect(gain);
+          gain.connect(this.masterGain);
+          osc.start(time);
+          osc.stop(time + 0.5);
+        }
+
+        playHat(time, decay) {
+          const bufferSize = this.ctx.sampleRate * decay;
+          if (bufferSize <= 0) return;
+          const buffer = this.ctx.createBuffer(
+            1,
+            bufferSize,
+            this.ctx.sampleRate,
+          );
+          const data = buffer.getChannelData(0);
+          for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+          const noiseSource = this.ctx.createBufferSource();
+          noiseSource.buffer = buffer;
+          const filter = this.ctx.createBiquadFilter();
+          filter.type = "highpass";
+          filter.frequency.value = 7000;
+          const gain = this.ctx.createGain();
+          gain.gain.setValueAtTime(0.3, time);
+          gain.gain.exponentialRampToValueAtTime(0.01, time + decay);
+          noiseSource.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+          noiseSource.start(time);
+        }
+
+        playAcidBass(time, freq) {
+          const osc = this.ctx.createOscillator();
+          osc.type = "sawtooth";
+          const filter = this.ctx.createBiquadFilter();
+          filter.type = "lowpass";
+          filter.Q.value = 15;
+          filter.frequency.setValueAtTime(this.filterCutoff * 2, time);
+          filter.frequency.exponentialRampToValueAtTime(
+            this.filterCutoff / 2,
+            time + 0.2,
+          );
+          const gain = this.ctx.createGain();
+          gain.gain.setValueAtTime(0.3, time);
+          gain.gain.linearRampToValueAtTime(0.01, time + 0.2);
+          osc.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+
+          let targetFreq = freq;
+          if (this.glitchFactor > 0.1) {
+            targetFreq *= 0.82 + Math.random() * 0.36; // digital pitch drift/flutter
+          }
+          osc.frequency.setValueAtTime(targetFreq, time);
+
+          osc.start(time);
+          osc.stop(time + 0.2);
+        }
+
+        playGlitchNoise(time) {
+          const osc = this.ctx.createOscillator();
+          const filter = this.ctx.createBiquadFilter();
+          const gain = this.ctx.createGain();
+
+          osc.type = Math.random() > 0.5 ? "sawtooth" : "square";
+          osc.frequency.setValueAtTime(400 + Math.random() * 3000, time);
+
+          filter.type = "bandpass";
+          filter.frequency.setValueAtTime(1200 + Math.random() * 4500, time);
+          filter.Q.value = 25;
+
+          gain.gain.setValueAtTime(0.12 * this.glitchFactor, time);
+          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.05);
+
+          osc.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+
+          osc.start(time);
+          osc.stop(time + 0.05);
+        }
+
+        playHeavyDrum(time) {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          const waveShaper = this.ctx.createWaveShaper();
+          
+          const makeDistortionCurve = (amount = 20) => {
+            const k = typeof amount === 'number' ? amount : 50;
+            const n_samples = 44100;
+            const curve = new Float32Array(n_samples);
+            const deg = Math.PI / 180;
+            for (let i = 0 ; i < n_samples; ++i ) {
+              const x = (i * 2) / n_samples - 1;
+              curve[i] = ( 3 + k ) * x * 20 * deg / ( Math.PI + k * Math.abs(x) );
+            }
+            return curve;
+          };
+          waveShaper.curve = makeDistortionCurve(15);
+          waveShaper.oversample = '4x';
+
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(100, time);
+          osc.frequency.exponentialRampToValueAtTime(30, time + 0.6);
+
+          const lowpass = this.ctx.createBiquadFilter();
+          lowpass.type = "lowpass";
+          lowpass.frequency.setValueAtTime(250, time);
+          lowpass.frequency.exponentialRampToValueAtTime(60, time + 0.4);
+          lowpass.Q.value = 5;
+
+          gain.gain.setValueAtTime(0.7, time);
+          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.6);
+
+          osc.connect(waveShaper);
+          waveShaper.connect(lowpass);
+          lowpass.connect(gain);
+          gain.connect(this.masterGain);
+
+          osc.start(time);
+          osc.stop(time + 0.61);
+        }
+
+        playGreekMetalRattle(time) {
+          const osc = this.ctx.createOscillator();
+          const modulator = this.ctx.createOscillator();
+          const modGain = this.ctx.createGain();
+          const gain = this.ctx.createGain();
+          const filter = this.ctx.createBiquadFilter();
+
+          modulator.type = "sawtooth";
+          modulator.frequency.value = 350;
+          modGain.gain.value = 800;
+
+          osc.type = "triangle";
+          osc.frequency.value = 1450;
+
+          filter.type = "bandpass";
+          filter.frequency.setValueAtTime(12000, time);
+          filter.frequency.exponentialRampToValueAtTime(2000, time + 0.25);
+          filter.Q.value = 8;
+
+          gain.gain.setValueAtTime(0.18, time);
+          gain.gain.exponentialRampToValueAtTime(0.005, time + 0.25);
+
+          modulator.connect(modGain);
+          modGain.connect(osc.frequency);
+          osc.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+
+          modulator.start(time);
+          osc.start(time);
+          modulator.stop(time + 0.26);
+          osc.stop(time + 0.26);
+        }
+
+        playGreekBass(time, freq) {
+          const osc1 = this.ctx.createOscillator();
+          const osc2 = this.ctx.createOscillator();
+          const filter = this.ctx.createBiquadFilter();
+          const gain = this.ctx.createGain();
+
+          osc1.type = "sawtooth";
+          osc1.frequency.setValueAtTime(freq, time);
+          
+          osc2.type = "square";
+          osc2.frequency.setValueAtTime(freq * 0.5, time);
+
+          filter.type = "lowpass";
+          filter.Q.value = 10;
+          filter.frequency.setValueAtTime(120, time);
+          filter.frequency.exponentialRampToValueAtTime(450, time + 0.15);
+          filter.frequency.exponentialRampToValueAtTime(80, time + 0.38);
+
+          gain.gain.setValueAtTime(0.35, time);
+          gain.gain.linearRampToValueAtTime(0.01, time + 0.4);
+
+          osc1.connect(filter);
+          osc2.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+
+          osc1.start(time);
+          osc2.start(time);
+          osc1.stop(time + 0.41);
+          osc2.stop(time + 0.41);
+        }
+
+        playEerieScreech(time) {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(2000, time);
+          osc.frequency.exponentialRampToValueAtTime(8000, time + 0.3);
+
+          gain.gain.setValueAtTime(0.05, time);
+          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.3);
+
+          osc.connect(gain);
+          gain.connect(this.masterGain);
+          osc.start(time);
+          osc.stop(time + 0.3);
+        }
+
+        playWarmHeartbeat(time) {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          const lp = this.ctx.createBiquadFilter();
+
+          lp.type = "lowpass";
+          lp.frequency.value = 120;
+
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(80, time);
+          osc.frequency.exponentialRampToValueAtTime(25, time + 0.3);
+
+          gain.gain.setValueAtTime(0.65, time);
+          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.35);
+
+          osc.connect(lp);
+          lp.connect(gain);
+          gain.connect(this.masterGain);
+
+          osc.start(time);
+          osc.stop(time + 0.36);
+        }
+
+        playTempleChime(time, freq) {
+          const ratios = [1.0, 2.0, 3.01, 4.12, 5.25];
+          const volumes = [0.22, 0.12, 0.08, 0.05, 0.02];
+          const decays = [0.8, 0.5, 0.3, 0.15, 0.08];
+
+          ratios.forEach((ratio, index) => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            const filter = this.ctx.createBiquadFilter();
+
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(freq * ratio, time);
+
+            filter.type = "highpass";
+            filter.frequency.value = 200;
+
+            const finalVol = volumes[index] * 0.45;
+            const finalDecay = decays[index] * 1.5;
+
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(finalVol, time + 0.008);
+            gain.gain.exponentialRampToValueAtTime(0.001, time + finalDecay);
+
+            osc.connect(filter);
+            filter.connect(gain);
+            gain.connect(this.masterGain);
+
+            osc.start(time);
+            osc.stop(time + finalDecay + 0.05);
+          });
+        }
+
+        playCosmicSwell(time) {
+          const osc1 = this.ctx.createOscillator();
+          const osc2 = this.ctx.createOscillator();
+          const filter = this.ctx.createBiquadFilter();
+          const gain = this.ctx.createGain();
+
+          osc1.type = "sawtooth";
+          osc1.frequency.value = 110.0;
+          osc2.type = "triangle";
+          osc2.frequency.value = 110.5;
+
+          filter.type = "lowpass";
+          filter.Q.value = 4.0;
+          filter.frequency.setValueAtTime(100, time);
+          filter.frequency.exponentialRampToValueAtTime(1800, time + 1.2);
+          filter.frequency.exponentialRampToValueAtTime(150, time + 2.5);
+
+          gain.gain.setValueAtTime(0, time);
+          gain.gain.linearRampToValueAtTime(0.18, time + 0.8);
+          gain.gain.exponentialRampToValueAtTime(0.001, time + 2.5);
+
+          osc1.connect(filter);
+          osc2.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.masterGain);
+
+          osc1.start(time);
+          osc2.start(time);
+          osc1.stop(time + 2.6);
+          osc2.stop(time + 2.6);
+        }
+
+        playLaser() {
+          const now = this.ctx.currentTime;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(880, now);
+          osc.frequency.exponentialRampToValueAtTime(110, now + 0.15);
+          gain.gain.setValueAtTime(0.4, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+          osc.connect(gain);
+          gain.connect(this.masterGain);
+          osc.start(now);
+          osc.stop(now + 0.15);
+        }
+
+        playImpact() {
+          const now = this.ctx.currentTime;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = "square";
+          osc.frequency.setValueAtTime(100, now);
+          osc.frequency.exponentialRampToValueAtTime(10, now + 0.3);
+          gain.gain.setValueAtTime(0.8, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+          osc.connect(gain);
+          gain.connect(this.masterGain);
+          osc.start(now);
+          osc.stop(now + 0.3);
+        }
+
+        playSuccess() {
+          const now = this.ctx.currentTime;
+          [523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = "square";
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0, now + i * 0.05);
+            gain.gain.linearRampToValueAtTime(0.3, now + i * 0.05 + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.05 + 0.15);
+            osc.connect(gain);
+            gain.connect(this.masterGain);
+            osc.start(now + i * 0.05);
+            osc.stop(now + i * 0.05 + 0.15);
+          });
+        }
+
+        updateFlightParams(throttle, velocity, tiltX, tiltZ, yawAmount, dt) {
+          const targetBpm = 110 + Math.abs(throttle) * 35;
+          this.bpm += (targetBpm - this.bpm) * 0.05;
+          const tiltMagnitude = Math.abs(tiltX) + Math.abs(tiltZ);
+          this.filterCutoff = 200 + tiltMagnitude * 2000;
+          this.hatDecay = 0.05 + Math.abs(yawAmount) * 0.15;
+
+          if (dt) {
+            this.glitchFactor = Math.max(0, this.glitchFactor - dt * 2.5); // decay glitch over time
+          }
+        }
+
+        updateParams(altitude) {
+          const targetFreq = Math.max(
+            800,
+            Math.min(20000, 20000 - altitude * 1000),
+          );
+          this.globalFilter.frequency.setTargetAtTime(
+            targetFreq,
+            this.ctx.currentTime,
+            0.1,
+          );
+        }
+
+        updateSpatialAudio(dronePos, cameraPos, cameraQuat) {
+          if (!this.panner || !this.ctx || this.ctx.state !== "running") return;
+          const time = this.ctx.currentTime + 0.05;
+          this.panner.positionX.setTargetAtTime(dronePos.x, time, 0.1);
+          this.panner.positionY.setTargetAtTime(dronePos.y, time, 0.1);
+          this.panner.positionZ.setTargetAtTime(dronePos.z, time, 0.1);
+
+          const listener = this.ctx.listener;
+          if (listener.positionX) {
+            listener.positionX.setTargetAtTime(cameraPos.x, time, 0.1);
+            listener.positionY.setTargetAtTime(cameraPos.y, time, 0.1);
+            listener.positionZ.setTargetAtTime(cameraPos.z, time, 0.1);
+
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+              cameraQuat,
+            );
+            const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cameraQuat);
+
+            listener.forwardX.setTargetAtTime(forward.x, time, 0.1);
+            listener.forwardY.setTargetAtTime(forward.y, time, 0.1);
+            listener.forwardZ.setTargetAtTime(forward.z, time, 0.1);
+
+            listener.upX.setTargetAtTime(up.x, time, 0.1);
+            listener.upY.setTargetAtTime(up.y, time, 0.1);
+            listener.upZ.setTargetAtTime(up.z, time, 0.1);
+          }
+        }
+      }
+
+      class LiveCoPilot {
+        constructor() {
+          this.ws = null;
+          this.inputAudioCtx = null;
+          this.outputAudioCtx = null;
+          this.stream = null;
+          this.processor = null;
+          this.source = null;
+          this.isActive = false;
+          this.nextStartTime = 0;
+          this.onStatusChange = null;
+          this.videoInterval = null;
+          this.videoEl = null;
+          this.canvasEl = null;
+        }
+
+        async connect() {
+          if (this.isActive) return;
+          this.isActive = true;
+          this.hasCustomError = false;
+          if (this.onStatusChange) this.onStatusChange("CONNECTING...");
+
+          const protocol =
+            window.location.protocol === "https:" ? "wss:" : "ws:";
+          this.ws = new WebSocket(`${protocol}//${window.location.host}/live`);
+
+          this.inputAudioCtx = new AudioContext({ sampleRate: 16000 });
+          this.outputAudioCtx = new AudioContext({ sampleRate: 24000 });
+          this.nextStartTime = 0;
+
+          try {
+            this.stream = await navigator.mediaDevices.getUserMedia({
+              audio: { echoCancellation: true, noiseSuppression: true },
+            });
+
+            try {
+              this.videoStream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  facingMode: "environment",
+                  width: { ideal: 640 },
+                  height: { ideal: 480 },
+                },
+              });
+              this.videoEl = document.createElement("video");
+              this.videoEl.srcObject = this.videoStream;
+              this.videoEl.play();
+              this.canvasEl = document.createElement("canvas");
+              this.canvasEl.width = 640;
+              this.canvasEl.height = 480;
+
+              this.videoInterval = setInterval(() => {
+                if (
+                  this.ws &&
+                  this.ws.readyState === WebSocket.OPEN &&
+                  this.videoEl.readyState >= 2
+                ) {
+                  const ctx = this.canvasEl.getContext("2d");
+                  ctx.drawImage(this.videoEl, 0, 0, 640, 480);
+                  const base64 = this.canvasEl.toDataURL("image/jpeg", 0.6);
+                  this.ws.send(JSON.stringify({ image: base64 }));
+                }
+              }, 1000); // 1 FPS
+            } catch (videoErr) {
+              console.warn(
+                "Video copilot disabled (no camera or denied):",
+                videoErr,
+              );
+            }
+
+            this.source = this.inputAudioCtx.createMediaStreamSource(
+              this.stream,
+            );
+            this.processor = this.inputAudioCtx.createScriptProcessor(
+              4096,
+              1,
+              1,
+            );
+            this.source.connect(this.processor);
+            this.processor.connect(this.inputAudioCtx.destination);
+
+            this.processor.onaudioprocess = (e) => {
+              if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                const pcmData = e.inputBuffer.getChannelData(0);
+                let buffer = new ArrayBuffer(pcmData.length * 2);
+                let view = new DataView(buffer);
+                for (let i = 0; i < pcmData.length; i++) {
+                  let s = Math.max(-1, Math.min(1, pcmData[i]));
+                  view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+                }
+                let binary = "";
+                let bytes = new Uint8Array(buffer);
+                for (let i = 0; i < bytes.byteLength; i++) {
+                  binary += String.fromCharCode(bytes[i]);
+                }
+                this.ws.send(JSON.stringify({ audio: btoa(binary) }));
+              }
+            };
+
+            this.ws.onopen = () => {
+              if (this.onStatusChange)
+                this.onStatusChange("LIVE API CONNECTED");
+            };
+
+            this.ws.onclose = () => {
+              if (this.onStatusChange && this.isActive) {
+                if (!this.hasCustomError) {
+                  this.onStatusChange("CONNECTION LOST");
+                }
+              }
+              this.disconnect();
+            };
+
+            this.ws.onmessage = (event) => {
+              const msg = JSON.parse(event.data);
+              if (msg.error) {
+                this.hasCustomError = true;
+                if (this.onStatusChange) this.onStatusChange(msg.error);
+              }
+              if (msg.audio) this.playAudioChunk(msg.audio);
+              if (msg.interrupted) this.nextStartTime = 0;
+            };
+          } catch (err) {
+            console.error("CoPilot Mic error:", err);
+            if (this.onStatusChange) this.onStatusChange("MIC ACCESS FAILED");
+            this.disconnect();
+          }
+        }
+
+        playAudioChunk(base64) {
+          if (!this.outputAudioCtx) return;
+          let binary;
+          try {
+            binary = atob(base64);
+          } catch (e) {
+            return;
+          }
+          const len = binary.length / 2;
+          const buffer = this.outputAudioCtx.createBuffer(1, len, 24000);
+          const channelData = buffer.getChannelData(0);
+
+          let offset = 0;
+          for (let i = 0; i < len; i++) {
+            let low = binary.charCodeAt(offset);
+            let high = binary.charCodeAt(offset + 1);
+            let sample = (high << 8) | low;
+            if (sample > 32767) sample -= 65536;
+            channelData[i] = sample / 32768.0;
+            offset += 2;
+          }
+
+          const source = this.outputAudioCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(this.outputAudioCtx.destination);
+
+          const now = this.outputAudioCtx.currentTime;
+          if (this.nextStartTime < now) this.nextStartTime = now;
+
+          source.start(this.nextStartTime);
+          this.nextStartTime += buffer.duration;
+        }
+
+        disconnect() {
+          this.isActive = false;
+          if (this.videoInterval) {
+            clearInterval(this.videoInterval);
+            this.videoInterval = null;
+          }
+          if (this.onStatusChange) this.onStatusChange("AI CO-PILOT OFFLINE");
+          if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+          }
+          if (this.processor) {
+            this.processor.disconnect();
+            this.processor = null;
+          }
+          if (this.source) {
+            this.source.disconnect();
+            this.source = null;
+          }
+          if (this.videoStream) {
+            this.videoStream.getTracks().forEach((t) => t.stop());
+            this.videoStream = null;
+          }
+          if (this.stream) {
+            this.stream.getTracks().forEach((t) => t.stop());
+            this.stream = null;
+          }
+          if (this.inputAudioCtx) {
+            this.inputAudioCtx.close();
+            this.inputAudioCtx = null;
+          }
+          if (this.outputAudioCtx) {
+            this.outputAudioCtx.close();
+            this.outputAudioCtx = null;
+          }
+          this.videoEl = null;
+          this.canvasEl = null;
+        }
+      }
+
+      /**
+       * Multiverse Drone Flight Simulator MVP3
+       */
+      class DroneSimulator extends xb.Script {
+        constructor() {
+          super();
+          this.velocity = new THREE.Vector3(0, 0, 0);
+          this.rotors = [];
+          this.leds = [];
+          this.keys = {
+            w: false,
+            a: false,
+            s: false,
+            d: false,
+            up: false,
+            down: false,
+            left: false,
+            right: false,
+          };
+          this.time = 0;
+          this.frameCount = 0;
+          this.gestureL = "NONE";
+          this.gestureR = "NONE";
+
+          this.smoothedInputs = { throttle: 0, yaw: 0, pitch: 0, roll: 0 };
+
+          this.fpvCamera = new THREE.PerspectiveCamera(
+            80,
+            1.2 / 0.9,
+            0.05,
+            100,
+          );
+
+          this.laserPool = [];
+          this.activeTargets = [];
+          this.particlePool = [];
+          this.score = 0;
+          this.lastFireTime = 0;
+
+          this.synth = new TechnoDroneSynth();
+          this.audioStarted = false;
+          this.currentBPM = 120;
+          this.systemIntegrity = 100;
+          this.rotorGlitchActive = 0;
+
+          this.currentMode = "AR";
+
+          this.trackedObject = null;
+          this.lastScanTime = 0;
+          this.isScanning = false;
+          this.pcaEnabled = false;
+
+          // Joysticks & Flight Modes
+          this.flightMode = "RC";
+          this.kineticTarget = new THREE.Vector3();
+          this.droneStartPos = new THREE.Vector3();
+          this.kineticActive = false;
+
+          this.leftPinchOrigin = null;
+          this.rightPinchOrigin = null;
+          this.joystickSensitivity = 5.0;
+
+          // WebXR Physical Hit Testing
+          this.hitTestSource = null;
+          this.trueGroundLevel = 0.0;
+          this.lastHitPos = null;
+
+          // Camera View Manager Capability Integration
+          this.cameraStream = null;
+        }
+
+        async captureCameraFrame() {
+          return new Promise(async (resolve) => {
+            try {
+              // Tap into the device's environment-facing camera
+              const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment" },
+              });
+              const video = document.createElement("video");
+              video.srcObject = stream;
+              video.setAttribute("playsinline", "");
+              video.play();
+
+              video.onloadeddata = () => {
+                // Capture the frame to an offscreen canvas
+                const canvas = document.createElement("canvas");
+                canvas.width = video.videoWidth || 640;
+                canvas.height = video.videoHeight || 480;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                // Extract base64 image data for the AI payload
+                const base64 = canvas
+                  .toDataURL("image/jpeg", 0.8)
+                  .split(",")[1];
+
+                // Cleanup hardware tracks
+                stream.getTracks().forEach((track) => track.stop());
+                resolve(base64);
+              };
+
+              // Failsafe timeout in case the XR session blocks hardware access
+              setTimeout(() => resolve(null), 2500);
+            } catch (err) {
+              console.warn("Camera optical capture blocked or failed:", err);
+              resolve(null); // Gracefully fallback to distance-based AI logic
+            }
+          });
+        }
+
+        init() {
+          try {
+            this.copilot = new LiveCoPilot();
+          } catch(e) { console.error("Failed to initialize Copilot", e); }
+
+          this.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.5));
+          const dirLight = new THREE.DirectionalLight(0xffffff, 3);
+          dirLight.position.set(5, 10, 5);
+          dirLight.castShadow = true;
+          this.add(dirLight);
+
+          try {
+            this.rainParticles = new RainParticles();
+            this.add(this.rainParticles);
+            this.rainParticles.init();
+          } catch(e) { console.error("Failed to initialize rainParticles", e); }
+
+          // this.cloud = new VolumetricCloud();
+          // this.add(this.cloud);
+
+          try {
+            this.listener = new THREE.AudioListener();
+            if (xb && xb.core && xb.core.camera) {
+              xb.core.camera.add(this.listener);
+            }
+            this.rainSound = new THREE.Audio(this.listener);
+            const audioLoader = new THREE.AudioLoader();
+            const ASSETS_PATH =
+              "https://cdn.jsdelivr.net/gh/google/xrblocks@main/";
+            audioLoader.load(ASSETS_PATH + "demos/rain/rain.opus", (buffer) => {
+              this.rainSound.setBuffer(buffer);
+              this.rainSound.setLoop(true);
+              this.rainSound.setVolume(0.5);
+              if (this.audioStarted) this.rainSound.play();
+            }, undefined, (err) => console.warn("Failed to load rain sound", err));
+          } catch(e) { console.error("Failed to initialize spatial audio listener / buffer", e); }
+
+          this.envGrid = new THREE.GridHelper(100, 100, 0x00ff00, 0x222222);
+          this.envGrid.position.y = 0.01;
+          this.envGrid.visible = false;
+          this.add(this.envGrid);
+
+          try {
+            // Setup training chamber for physical laser/paintball collisions in all modes
+            this.collidableSurfaces = [];
+            this.createHolographicChamber();
+          } catch(e) { console.error("Failed to initialize holographic chamber", e); }
+
+          try {
+            // Real-World Reticle setup
+            const reticleGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(
+              -Math.PI / 2,
+            );
+            const reticleMat = new THREE.MeshBasicMaterial({
+              color: 0x00ffc8,
+              side: THREE.DoubleSide,
+            });
+            this.reticle = new THREE.Mesh(reticleGeo, reticleMat);
+            this.reticle.matrixAutoUpdate = false;
+            this.reticle.visible = false;
+            this.add(this.reticle);
+          } catch(e) { console.error("Failed to initialize Reticle", e); }
+
+          try {
+            this.initObjectPools();
+            this.createParticleSystem();
+            this.spawnTarget();
+          } catch(e) { console.error("Failed to initialize object pools / particles", e); }
+
+          try {
+            this.createDrone();
+          } catch(e) { console.error("Failed to initialize drone", e); }
+
+          try {
+            this.createTelemetryUI();
+          } catch(e) { console.error("Failed to initialize telemetry UI", e); }
+
+          try {
+            this.createScannerUI();
+          } catch(e) { console.error("Failed to initialize scanner UI", e); }
+
+          try {
+            this.createWristUI();
+          } catch(e) { console.error("Failed to initialize wrist UI", e); }
+
+          try {
+            this.createJoystickVisuals();
+          } catch(e) { console.error("Failed to initialize joystick visuals", e); }
+
+          try {
+            this.setupKeyboardControls();
+            this.setupXRHandshake();
+          } catch(e) { console.error("Failed to setup keyboard/handshake controls", e); }
+
+          try {
+            // Connect directly to Quest 3 Camera System
+            this.setupHardwareCamera();
+          } catch(e) { console.error("Failed to setup hardware camera connection", e); }
+
+          try {
+            // Setup shadows if possible
+            if (xb.core.renderer) {
+              xb.core.renderer.shadowMap.enabled = true;
+              xb.core.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            }
+          } catch(e) { console.error("Failed to set shadow configurations on renderer", e); }
+
+          try {
+            this.vrManager = new VRWorldManager(this, this.synth);
+          } catch(e) { console.error("Failed to initialize VRWorldManager addon", e); }
+        }
+
+        setupHardwareCamera() {
+          this.cameraStream = xb.core.deviceCamera;
+          if (this.cameraStream) {
+            this.cameraStream.addEventListener("statechange", (event) => {
+              const cameraStateLabel = {
+                initializing: "Initializing camera...",
+                no_devices_found: "Unsupported browser/device",
+                error: "Camera failed to start",
+              };
+              const labelText =
+                event.device?.label ||
+                cameraStateLabel[event.state] ||
+                "Camera Connected";
+              if (this.cameraLabel) {
+                this.cameraLabel.setText(labelText);
+              }
+              if (event.state === "streaming" && this.videoView) {
+                this.videoView.load(this.cameraStream);
+              }
+            });
+
+            if (this.cameraLabel) {
+              this.cameraLabel.setText(
+                this.cameraStream.getCurrentDevice()?.label ||
+                  "Camera Connected",
+              );
+            }
+            if (this.videoView && this.cameraStream.state === "streaming") {
+              this.videoView.load(this.cameraStream);
+            }
+          }
+        }
+
+        createHolographicChamber() {
+          this.holoRoomGroup = new THREE.Group();
+          this.add(this.holoRoomGroup);
+
+          const sizeW = 12;
+          const sizeH = 6;
+          const sizeD = 12;
+
+          // Cute semi-transparent holographic cyberwalls with cyan and orange colors
+          const wallMat = new THREE.MeshStandardMaterial({
+            color: 0x00ffc8,
+            roughness: 0.9,
+            metalness: 0.1,
+            transparent: true,
+            opacity: 0.08,
+            side: THREE.DoubleSide,
+            depthWrite: false
+          });
+
+          // 1. Grid Ground surface
+          const geoFloor = new THREE.PlaneGeometry(sizeW, sizeD);
+          const floorMesh = new THREE.Mesh(geoFloor, wallMat);
+          floorMesh.rotation.x = -Math.PI / 2;
+          floorMesh.position.y = 0.012; // offset slightly above standard Y=0
+          floorMesh.receiveShadow = true;
+          this.holoRoomGroup.add(floorMesh);
+          this.collidableSurfaces.push(floorMesh);
+
+          // 2. Ceiling
+          const ceilingMesh = new THREE.Mesh(geoFloor, wallMat);
+          ceilingMesh.rotation.x = Math.PI / 2;
+          ceilingMesh.position.y = sizeH;
+          this.holoRoomGroup.add(ceilingMesh);
+          this.collidableSurfaces.push(ceilingMesh);
+
+          // 3. North Wall
+          const geoWallN = new THREE.PlaneGeometry(sizeW, sizeH);
+          const wallNMesh = new THREE.Mesh(geoWallN, wallMat);
+          wallNMesh.position.set(0, sizeH / 2, -sizeD / 2);
+          this.holoRoomGroup.add(wallNMesh);
+          this.collidableSurfaces.push(wallNMesh);
+
+          // 4. South Wall
+          const wallSMesh = new THREE.Mesh(geoWallN, wallMat);
+          wallSMesh.rotation.y = Math.PI;
+          wallSMesh.position.set(0, sizeH / 2, sizeD / 2);
+          this.holoRoomGroup.add(wallSMesh);
+          this.collidableSurfaces.push(wallSMesh);
+
+          // 5. East Wall
+          const geoWallE = new THREE.PlaneGeometry(sizeD, sizeH);
+          const wallEMesh = new THREE.Mesh(geoWallE, wallMat);
+          wallEMesh.rotation.y = -Math.PI / 2;
+          wallEMesh.position.set(sizeW / 2, sizeH / 2, 0);
+          this.holoRoomGroup.add(wallEMesh);
+          this.collidableSurfaces.push(wallEMesh);
+
+          // 6. West Wall
+          const wallWMesh = new THREE.Mesh(geoWallE, wallMat);
+          wallWMesh.rotation.y = Math.PI / 2;
+          wallWMesh.position.set(-sizeW / 2, sizeH / 2, 0);
+          this.holoRoomGroup.add(wallWMesh);
+          this.collidableSurfaces.push(wallWMesh);
+
+          // Add a structural wireframe container box
+          const cageGeo = new THREE.BoxGeometry(sizeW, sizeH, sizeD);
+          const cageWireMat = new THREE.MeshBasicMaterial({
+            color: 0xff4100,
+            transparent: true,
+            opacity: 0.15,
+            wireframe: true
+          });
+          const cage = new THREE.Mesh(cageGeo, cageWireMat);
+          cage.position.set(0, sizeH / 2, 0);
+          this.holoRoomGroup.add(cage);
+
+          // Grid lines helper over the floor
+          const gridFloor = new THREE.GridHelper(sizeW, 12, 0x00ffc8, 0x333333);
+          gridFloor.position.y = 0.015;
+          this.holoRoomGroup.add(gridFloor);
+
+          // Corner safety boundary pillars
+          const colGeo = new THREE.CylinderGeometry(0.04, 0.04, sizeH, 8);
+          const colMat = new THREE.MeshStandardMaterial({
+            color: 0xff4100,
+            emissive: 0xff4100,
+            emissiveIntensity: 1.2
+          });
+          const coordinates = [
+            [-sizeW / 2, -sizeD / 2],
+            [sizeW / 2, -sizeD / 2],
+            [-sizeW / 2, sizeD / 2],
+            [sizeW / 2, sizeD / 2]
+          ];
+          coordinates.forEach(([cx, cz]) => {
+            const pillar = new THREE.Mesh(colGeo, colMat);
+            pillar.position.set(cx, sizeH / 2, cz);
+            this.holoRoomGroup.add(pillar);
+          });
+        }
+
+        async cycleCamera(offset) {
+          if (!this.cameraStream) return;
+          const devices = this.cameraStream.getAvailableDevices();
+          if (devices.length <= 1) return;
+          const newIndex =
+            (this.cameraStream.getCurrentDeviceIndex() +
+              offset +
+              devices.length) %
+            devices.length;
+          await this.cameraStream.setDeviceId(devices[newIndex].deviceId);
+          if (this.audioStarted)
+            this.synth.playHat(this.synth.ctx.currentTime, 0.1);
+        }
+
+        resumeAudio() {
+          if (!this.audioStarted) {
+            if (this.synth) this.synth.resume();
+            if (this.listener && this.listener.context.state === 'suspended') {
+              this.listener.context.resume();
+            }
+            if (this.rainSound && this.rainSound.buffer && !this.rainSound.isPlaying) {
+              this.rainSound.play();
+            }
+            this.audioStarted = true;
+          }
+        }
+
+        setupXRHandshake() {
+          if (xb.core.renderer && xb.core.renderer.xr) {
+            xb.core.renderer.xr.addEventListener("sessionstart", () => {
+              const session = xb.core.renderer.xr.getSession();
+              if (session) {
+                const startAudio = () => {
+                  this.resumeAudio();
+                };
+                session.addEventListener("select", startAudio);
+                session.addEventListener("selectstart", startAudio);
+
+                session
+                  .requestReferenceSpace("viewer")
+                  .then((refSpace) => {
+                    session
+                      .requestHitTestSource({ space: refSpace })
+                      .then((source) => {
+                        this.hitTestSource = source;
+                      })
+                      .catch((err) =>
+                        console.warn("Hit test source not available:", err),
+                      );
+                  })
+                  .catch((err) =>
+                    console.warn("Viewer space not available:", err),
+                  );
+              }
+            });
+          }
+        }
+
+        initObjectPools() {
+          const ballGeo = new THREE.SphereGeometry(0.04, 16, 16);
+
+          for (let i = 0; i < 30; i++) {
+            const ballColor = palette
+              ? palette.getRandomLiteGColor()
+              : new THREE.Color(0xefefef);
+            const ballMat = new THREE.MeshStandardMaterial({
+              color: ballColor,
+              roughness: 0.1,
+              metalness: 0.0,
+              clearcoat: 1.0,
+            });
+            const laser = new THREE.Mesh(ballGeo, ballMat);
+            laser.visible = false;
+            this.add(laser);
+            this.laserPool.push({
+              mesh: laser,
+              active: false,
+              age: 0,
+              velocity: new THREE.Vector3(),
+              color: ballColor,
+            });
+          }
+        }
+
+        createParticleSystem() {
+          this.particleGroup = new THREE.Group();
+          this.add(this.particleGroup);
+
+          const pGeo = new THREE.BoxGeometry(0.02, 0.02, 0.02);
+          const pMat = new THREE.MeshStandardMaterial({
+            color: 0xffcc00,
+            emissive: 0xff4100,
+            emissiveIntensity: 1.5,
+          });
+
+          for (let i = 0; i < 50; i++) {
+            const p = new THREE.Mesh(pGeo, pMat);
+            p.visible = false;
+            this.particleGroup.add(p);
+            this.particlePool.push({
+              mesh: p,
+              active: false,
+              vel: new THREE.Vector3(),
+              age: 0,
+            });
+          }
+        }
+
+        spawnExplosion(position, color) {
+          let count = 0;
+          const targetColor = color || new THREE.Color(0xff4100);
+          for (let p of this.particlePool) {
+            if (!p.active) {
+              if (p.mesh.material) {
+                p.mesh.material.color.copy(targetColor);
+                if (p.mesh.material.emissive) {
+                  p.mesh.material.emissive.copy(targetColor).multiplyScalar(0.4);
+                }
+              }
+              p.mesh.position.copy(position);
+              p.vel.set(
+                (Math.random() - 0.5) * 5.0,
+                (Math.random() - 0.2) * 5.0,
+                (Math.random() - 0.5) * 5.0,
+              );
+              p.active = true;
+              p.age = 0;
+              p.mesh.visible = true;
+              p.mesh.scale.set(1.4, 1.4, 1.4);
+              count++;
+              if (count >= 16) break;
+            }
+          }
+        }
+
+        spawnPropWash(altitude, groundLevel, dt) {
+          if (altitude > 1.5) return;
+          if (Math.random() > 0.35) return;
+
+          const p = this.particlePool.find((item) => !item.active);
+          if (p) {
+            const angle = Math.random() * Math.PI * 2;
+            const r = 0.05 + Math.random() * 0.15;
+            p.mesh.position.set(
+              this.drone.position.x + Math.cos(angle) * r,
+              groundLevel + 0.01,
+              this.drone.position.z + Math.sin(angle) * r,
+            );
+
+            const power = (1.5 - altitude) * 4.0;
+            p.vel.set(
+              Math.cos(angle) * power,
+              0.05 + Math.random() * 0.1,
+              Math.sin(angle) * power,
+            );
+
+            p.active = true;
+            p.age = 0;
+            p.mesh.visible = true;
+            p.mesh.scale.set(0.35, 0.35, 0.35); // Tiny dust particles
+          }
+        }
+
+        spawnTarget() {
+          // A highly detailed, premium Teenage Engineering Synthesizer / Tape Deck Core target
+          const target = new THREE.Group();
+
+          // TE Matte Off-White and Dark Materials
+          const matCream = new THREE.MeshStandardMaterial({ color: 0xf5f5ef, roughness: 0.8, metalness: 0.1, flatShading: true });
+          const matGrey  = new THREE.MeshStandardMaterial({ color: 0x959590, roughness: 0.8, metalness: 0.1, flatShading: true });
+          const matDark  = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9, metalness: 0.3, flatShading: true });
+          
+          const matSilver = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.3, metalness: 0.8 });
+          const matTEOrange = new THREE.MeshStandardMaterial({ color: 0xff3b00, roughness: 0.45, metalness: 0.1 });
+          const matTEYellow = new THREE.MeshStandardMaterial({ color: 0xffcc00, roughness: 0.45, metalness: 0.1 });
+          const matTEBlue   = new THREE.MeshStandardMaterial({ color: 0x0080ff, roughness: 0.45, metalness: 0.1 });
+          
+          const matLED_Orange = new THREE.MeshStandardMaterial({ color: 0xff3b00, emissive: 0xff3b00, emissiveIntensity: 3.5 });
+          const matLED_Green  = new THREE.MeshStandardMaterial({ color: 0x39ff14, emissive: 0x39ff14, emissiveIntensity: 2.5 });
+
+          // 1. Core Chassis Cube (Double-tier Pocket Operator style)
+          const chassis = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.24, 0.24), matDark);
+          chassis.castShadow = true;
+          chassis.receiveShadow = true;
+          target.add(chassis);
+
+          // Front-face Faceplate
+          const frontFace = new THREE.Mesh(new THREE.BoxGeometry(0.244, 0.20, 0.20), matCream);
+          frontFace.position.set(0, 0, 0);
+          chassis.add(frontFace);
+
+          // 2. Glossy LCD Display on front face (Z+ face)
+          const screen = new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.08, 0.008), matDark);
+          screen.position.set(0, 0.05, 0.101);
+          chassis.add(screen);
+
+          // Glowing tape deck reels visual inside the screen
+          const tapeReelLeft = new THREE.Mesh(new THREE.TorusGeometry(0.015, 0.003, 8, 16), matLED_Orange);
+          tapeReelLeft.position.set(-0.04, 0.05, 0.106);
+          chassis.add(tapeReelLeft);
+
+          const tapeReelRight = new THREE.Mesh(new THREE.TorusGeometry(0.015, 0.003, 8, 16), matLED_Orange);
+          tapeReelRight.position.set(0.04, 0.05, 0.106);
+          chassis.add(tapeReelRight);
+
+          // Center tape bridge bar
+          const tapeBar = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.004, 0.002), matLED_Orange);
+          tapeBar.position.set(0, 0.042, 0.106);
+          chassis.add(tapeBar);
+
+          // 3. Grid of tactile keys (Buttons) on the front face lower section
+          const btnGeo = new THREE.BoxGeometry(0.022, 0.022, 0.008);
+          const btnColors = [matDark, matGrey, matTEOrange, matTEYellow, matTEBlue, matCream];
+          let count = 0;
+          for (let row = -1; row <= 1; row++) {
+            for (let col = -1; col <= 1; col++) {
+              if (row === 0 && col === 0) continue; // Skip center for variety
+              const btn = new THREE.Mesh(btnGeo, btnColors[count % btnColors.length]);
+              btn.position.set(row * 0.045, -0.05 + col * 0.03, 0.101);
+              chassis.add(btn);
+              count++;
+            }
+          }
+
+          // 4. Physical analog dials on top face (Y+ face)
+          const dialBaseGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.006, 16);
+          const dialBase = new THREE.Mesh(dialBaseGeo, matDark);
+          dialBase.position.set(-0.05, 0.122, 0.05);
+          chassis.add(dialBase);
+
+          const dialCap = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.02, 16), matTEOrange);
+          dialCap.position.set(-0.05, 0.132, 0.05);
+          chassis.add(dialCap);
+
+          const ind = new THREE.Mesh(new THREE.BoxGeometry(0.003, 0.022, 0.005), matDark);
+          ind.position.set(-0.05, 0.143, 0.042);
+          chassis.add(ind);
+
+          // Rear-right dial (Yellow)
+          const dialBase2 = new THREE.Mesh(dialBaseGeo, matDark);
+          dialBase2.position.set(0.05, 0.122, -0.05);
+          chassis.add(dialBase2);
+
+          const dialCap2 = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.02, 16), matTEYellow);
+          dialCap2.position.set(0.05, 0.132, -0.05);
+          chassis.add(dialCap2);
+
+          // 5. Punch speaker holes matrix on left face (X- face)
+          const holeGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.002, 8).rotateZ(Math.PI / 2);
+          for (let xPos = -2; xPos <= 2; xPos++) {
+            for (let yPos = -2; yPos <= 2; yPos++) {
+              const hole = new THREE.Mesh(holeGeo, matDark);
+              hole.position.set(-0.121, yPos * 0.025, xPos * 0.025);
+              chassis.add(hole);
+            }
+          }
+
+          // 6. Glowing VU bar on right face (X+ face)
+          const vuBox = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.14, 0.02), matDark);
+          vuBox.position.set(0.121, -0.02, -0.05);
+          chassis.add(vuBox);
+
+          for (let s = 0; s < 5; s++) {
+            const segMat = (s >= 4) ? matLED_Orange : matLED_Green;
+            const segment = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.015, 0.014), segMat);
+            segment.position.set(0.122, -0.07 + s * 0.02, -0.05);
+            chassis.add(segment);
+          }
+
+          // 7. Mechanical side fader on the rear face (Z- face)
+          const sliderGroove = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.01, 0.002), matDark);
+          sliderGroove.position.set(0, 0, -0.121);
+          chassis.add(sliderGroove);
+
+          const sliderKnob = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.016, 0.01), matTEBlue);
+          sliderKnob.position.set(0.02, 0, -0.123);
+          chassis.add(sliderKnob);
+
+          if (this.currentMode === 'AR' && this.lastHitPos) {
+            target.position.copy(this.lastHitPos);
+            target.position.y += 0.2;
+          } else {
+            target.position.set(
+              (Math.random() - 0.5) * 6,
+              1.0 + Math.random() * 2,
+              -2 - Math.random() * 4,
+            );
+          }
+
+          this.add(target);
+          this.activeTargets.push(target);
+        }
+
+        setMode(mode) {
+          if (!xb.core.transition) return;
+          this.currentMode = mode;
+          if (mode === "AR") {
+            xb.core.transition.toAR();
+            this.envGrid.visible = false;
+            if (xb.core.scene) {
+              xb.core.scene.background = null;
+              xb.core.scene.fog = null;
+            }
+          } else if (mode === "VR") {
+            xb.core.transition.toVR({ color: 0x111111 });
+            this.envGrid.visible = true;
+            if (xb.core.scene) {
+              xb.core.scene.background = new THREE.Color(0x111111);
+            }
+          }
+        }
+
+        togglePCAFeed() {
+          this.pcaEnabled = !this.pcaEnabled;
+          if (this.audioStarted) this.synth.playSuccess();
+        }
+
+        toggleHUD() {
+          this.panel.visible = !this.panel.visible;
+          this.scannerPanel.visible = !this.scannerPanel.visible;
+          if (this.audioStarted)
+            this.synth.playHat(this.synth.ctx.currentTime, 0.1);
+        }
+
+        toggleFlightMode() {
+          this.flightMode = this.flightMode === "RC" ? "KINETIC" : "RC";
+          this.scanStatusText.setText(`MODE: ${this.flightMode}`);
+          if (this.audioStarted) this.synth.playSuccess();
+        }
+
+        toggleCoPilot() {
+          if (this.copilot.isActive) {
+            this.copilot.disconnect();
+          } else {
+            this.copilot.connect();
+          }
+          if (this.audioStarted) this.synth.playSuccess();
+        }
+
+        recallDrone() {
+          if (xb.core.camera && this.drone) {
+            const forward = new THREE.Vector3(0, 0, -1.5).applyQuaternion(
+              xb.core.camera.quaternion,
+            );
+            this.drone.position.copy(xb.core.camera.position).add(forward);
+            this.velocity.set(0, 0, 0);
+            this.smoothedInputs = { throttle: 0, yaw: 0, pitch: 0, roll: 0 };
+
+            if (this.audioStarted) this.synth.playSuccess();
+            this.triggerHaptic(1.0, 50);
+          }
+        }
+
+        createWristUI() {
+          this.wristGroup = new THREE.Group();
+
+          // TE Matte Materials and Brand Accent Colors
+          const matBody = new THREE.MeshStandardMaterial({ 
+            color: 0xeaeae2, // Matte Cream Off-White
+            roughness: 0.82, 
+            metalness: 0.1, 
+            flatShading: true 
+          });
+          const matBodyDark = new THREE.MeshStandardMaterial({ 
+            color: 0x242424, // Matte Slate/Carbon
+            roughness: 0.90, 
+            metalness: 0.25, 
+            flatShading: true 
+          });
+          const matGreyCollar = new THREE.MeshStandardMaterial({ 
+            color: 0x90908b, // Matte slate accent
+            roughness: 0.8, 
+            metalness: 0.1 
+          });
+          const matOrangeTPU = new THREE.MeshStandardMaterial({ 
+            color: 0xff3b00, // Studio Orange
+            roughness: 0.6, 
+            metalness: 0.05 
+          });
+          const matSilver = new THREE.MeshStandardMaterial({
+            color: 0xcccccc,
+            roughness: 0.3,
+            metalness: 0.8
+          });
+
+          // LED & LCD colors
+          const matLED_GlowOrange = new THREE.MeshStandardMaterial({ color: 0xff3b00, emissive: 0xff3b00, emissiveIntensity: 3.5 });
+          const matLED_GlowGreen  = new THREE.MeshStandardMaterial({ color: 0x39ff14, emissive: 0x39ff14, emissiveIntensity: 2.2 });
+          const matLED_GlowBlue   = new THREE.MeshStandardMaterial({ color: 0x0080ff, emissive: 0x0080ff, emissiveIntensity: 3.0 });
+
+          // 1. DUAL-LAYER BODY CHASSIS (EP-133 Retro Synthesizer Grid layout)
+          // Under-casing
+          const casingLower = new THREE.Mesh(new THREE.BoxGeometry(0.144, 0.016, 0.084), matBodyDark);
+          casingLower.castShadow = true;
+          casingLower.receiveShadow = true;
+          this.wristGroup.add(casingLower);
+
+          // Top Faceplate (Classic Matte Off-White)
+          const casingUpper = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.008, 0.08), matBody);
+          casingUpper.position.y = 0.01;
+          casingUpper.castShadow = true;
+          casingUpper.receiveShadow = true;
+          casingLower.add(casingUpper);
+
+          // Center design groove splitting panel sections
+          const designGroove = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.009, 0.076), matBodyDark);
+          designGroove.position.set(-0.02, 0, 0);
+          casingUpper.add(designGroove);
+
+          // 2. INDUSTRIAL PERFORATED TPU STRAPS (With active structural strap keepers)
+          const strapLength = 0.07;
+          
+          // Left orange strap
+          const strapLGroup = new THREE.Group();
+          strapLGroup.position.set(-0.072, -0.005, 0);
+          this.wristGroup.add(strapLGroup);
+
+          const strapL = new THREE.Mesh(new THREE.BoxGeometry(strapLength, 0.004, 0.06), matOrangeTPU);
+          strapL.position.x = -strapLength / 2;
+          strapLGroup.add(strapL);
+
+          // Perforated ventilation holes in orange strap
+          const holeGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.006, 8);
+          for (let i = 1; i <= 3; i++) {
+            const h = new THREE.Mesh(holeGeo, matBodyDark);
+            h.position.set(-i * 0.018, 0, 0);
+            strapLGroup.add(h);
+          }
+
+          // Right Slate Strap (representing adjustable loop side)
+          const strapRGroup = new THREE.Group();
+          strapRGroup.position.set(0.072, -0.005, 0);
+          this.wristGroup.add(strapRGroup);
+
+          const strapR = new THREE.Mesh(new THREE.BoxGeometry(strapLength, 0.004, 0.06), matBodyDark);
+          strapR.position.x = strapLength / 2;
+          strapRGroup.add(strapR);
+
+          // Buckle loop detail
+          const buckle = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.008, 0.064), matSilver);
+          buckle.position.set(0.002, 0.002, 0);
+          strapRGroup.add(buckle);
+
+          // 3. MECHANICAL KEYS / DOUBLE-SHOT BUTTONS
+          this.wristButtons = [];
+
+          const commands = [
+            { id: 'toggleHUD', color: 0xff3b00, label: 'HUD' },      // Studio Orange
+            { id: 'togglePCA', color: 0xeaeae2, label: 'FEED' },     // Chalky Cream
+            { id: 'recallDrone', color: 0xffcc00, label: 'CALL' },   // Primrose Yellow
+            { id: 'toggleFlightMode', color: 0x90908b, label: 'MODE' }, // Slate Grey
+            { id: 'toggleCoPilot', color: 0x0080ff, label: 'COPL' },  // Accent Blue
+          ];
+
+          const buttonSpacing = 0.024;
+          const buttonBaseHeight = 0.012;
+
+          commands.forEach((cmd, idx) => {
+            const buttonAssembly = new THREE.Group();
+            buttonAssembly.position.set(-0.048 + idx * buttonSpacing, 0.008, 0.02);
+            casingUpper.add(buttonAssembly);
+
+            // Dark housing collar around mechanical key
+            const collar = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.004, 0.018), matBodyDark);
+            collar.position.y = 0.001;
+            buttonAssembly.add(collar);
+
+            // True mechanical square keycap
+            const keycapMat = new THREE.MeshStandardMaterial({
+              color: cmd.color,
+              roughness: 0.5,
+              metalness: 0.05,
+              flatShading: true
+            });
+            const keycap = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.008, 0.014), keycapMat);
+            keycap.position.y = 0.005;
+            keycap.castShadow = true;
+            buttonAssembly.add(keycap);
+
+            // Embed trigger actions and height registration directly into key mesh
+            keycap.userData = { action: cmd.id, baseHeight: buttonBaseHeight };
+            this.wristButtons.push(keycap);
+
+            // Dedicated indicator LED dot next to button
+            const ledDotMat = (cmd.id === 'toggleHUD' || cmd.id === 'recallDrone') ? matLED_GlowOrange : matLED_GlowGreen;
+            const led = new THREE.Mesh(new THREE.CylinderGeometry(0.0018, 0.0018, 0.002, 8), ledDotMat);
+            led.position.set(0, -0.002, -0.012);
+            buttonAssembly.add(led);
+          });
+
+          // 4. MINI RETRO GLOSS BLACK LCD SCREEN
+          const lcdScreen = new THREE.Mesh(new THREE.BoxGeometry(0.124, 0.002, 0.034), matBodyDark);
+          lcdScreen.position.set(0, 0.006, -0.02);
+          casingUpper.add(lcdScreen);
+
+          // Glowing grid metrics & visualizer inside LCD Frame
+          const barCount = 12;
+          for (let b = 0; b < barCount; b++) {
+            const barHeight = 0.004 + (Math.sin(b * 0.8) + 1.0) * 0.006;
+            const barMat = (b % 4 === 0) ? matLED_GlowOrange : (b % 3 === 0 ? matLED_GlowBlue : matLED_GlowGreen);
+            const bar = new THREE.Mesh(new THREE.BoxGeometry(0.003, 0.001, barHeight), barMat);
+            bar.position.set(-0.045 + b * 0.008, 0.0015, -0.02 + 0.001); // Render inside screen
+            casingUpper.add(bar);
+          }
+
+          // Dedicated AMBER glows representing 'battery' and 'telemetry locked' statuses
+          const statusLED1 = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.001, 0.004), matLED_GlowOrange);
+          statusLED1.position.set(0.048, 0.0075, -0.026);
+          casingUpper.add(statusLED1);
+
+          const statusLED2 = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.001, 0.004), matLED_GlowGreen);
+          statusLED2.position.set(0.048, 0.0075, -0.016);
+          casingUpper.add(statusLED2);
+
+          // 5. FOUR RIVETS/SCREWS IN CORNERS (Signature TE style)
+          const rivetLocations = [
+            { x:  0.062, z:  0.032 },
+            { x: -0.062, z:  0.032 },
+            { x:  0.062, z: -0.032 },
+            { x: -0.062, z: -0.032 },
+          ];
+          const rivetGeo = new THREE.CylinderGeometry(0.003, 0.003, 0.008, 12);
+          rivetLocations.forEach(loc => {
+            const r = new THREE.Mesh(rivetGeo, matSilver);
+            r.position.set(loc.x, 0.007, loc.z);
+            casingUpper.add(r);
+
+            // Slotted core detail
+            const slot = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.0015, 0.001), matBodyDark);
+            slot.position.set(loc.x, 0.011, loc.z);
+            casingUpper.add(slot);
+          });
+
+          // 6. VOLUMETRIC METALLIC CROWN DIAL (Encoder Knob)
+          const dialBase = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.004, 16), matBodyDark);
+          dialBase.position.set(-0.048, 0.007, -0.02);
+          casingUpper.add(dialBase);
+
+          const dialKnob = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.012, 16), matOrangeTPU);
+          dialKnob.position.set(-0.048, 0.012, -0.02);
+          casingUpper.add(dialKnob);
+
+          const dialIndicator = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.014, 0.003), matBodyDark);
+          dialIndicator.position.set(-0.048, 0.013, -0.023);
+          casingUpper.add(dialIndicator);
+
+          this.add(this.wristGroup);
+          this.wristGroup.visible = false;
+          this.wristGroup.scale.set(0.01, 0.01, 0.01);
+          this.lastWristPress = 0;
+        }
+
+        createJoystickVisuals() {
+          const sphereGeo = new THREE.SphereGeometry(0.025, 16, 16);
+
+          const leftMat = new THREE.MeshBasicMaterial({
+            color: 0xff4100,
+            transparent: true,
+            opacity: 0.65,
+          });
+          this.leftJoySphere = new THREE.Mesh(sphereGeo, leftMat);
+          this.leftJoySphere.visible = false;
+          this.add(this.leftJoySphere);
+
+          this.leftJoyTip = new THREE.Mesh(
+            new THREE.SphereGeometry(0.015, 12, 12),
+            new THREE.MeshBasicMaterial({ color: 0xff4100 }),
+          );
+          this.leftJoyTip.visible = false;
+          this.add(this.leftJoyTip);
+
+          const rightMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffc8,
+            transparent: true,
+            opacity: 0.65,
+          });
+          this.rightJoySphere = new THREE.Mesh(sphereGeo, rightMat);
+          this.rightJoySphere.visible = false;
+          this.add(this.rightJoySphere);
+
+          this.rightJoyTip = new THREE.Mesh(
+            new THREE.SphereGeometry(0.015, 12, 12),
+            new THREE.MeshBasicMaterial({ color: 0x00ffc8 }),
+          );
+          this.rightJoyTip.visible = false;
+          this.add(this.rightJoyTip);
+
+          const lineMatL = new THREE.LineBasicMaterial({
+            color: 0xff4100,
+            linewidth: 2,
+          });
+          const lineGeoL = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(),
+            new THREE.Vector3(),
+          ]);
+          this.leftJoyLine = new THREE.Line(lineGeoL, lineMatL);
+          this.leftJoyLine.visible = false;
+          this.add(this.leftJoyLine);
+
+          const lineMatR = new THREE.LineBasicMaterial({
+            color: 0x00ffc8,
+            linewidth: 2,
+          });
+          const lineGeoR = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(),
+            new THREE.Vector3(),
+          ]);
+          this.rightJoyLine = new THREE.Line(lineGeoR, lineMatR);
+          this.rightJoyLine.visible = false;
+          this.add(this.rightJoyLine);
+        }
+
+        createDrone() {
+          this.drone = new THREE.Group();
+          this.drone.position.set(0, 0.16, -3);
+          this.add(this.drone);
+
+          this.gimbalGroup = new THREE.Group();
+          this.gimbalGroup.position.set(0, -0.04, -0.16); // Front-bottom mount
+          this.fpvCamera.position.z = -0.04;
+
+          // Camera Lens Water Droplet Effects
+          this.lensOverlayGroup = new THREE.Group();
+          this.lensOverlayGroup.position.set(0, 0, -0.05); // Just in front of the FPV camera
+          this.fpvCamera.add(this.lensOverlayGroup);
+          
+          this.lensDrops = [];
+          
+          this.gimbalGroup.add(this.fpvCamera);
+
+          const scanConeMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffff,
+            transparent: true,
+            opacity: 0.15,
+            wireframe: true,
+          });
+          this.scanCone = new THREE.Mesh(
+            new THREE.ConeGeometry(0.8, 8, 16)
+              .rotateX(-Math.PI / 2)
+              .translate(0, 0, -4),
+            scanConeMat,
+          );
+          this.scanCone.visible = false;
+          this.gimbalGroup.add(this.scanCone);
+          
+          this.drone.add(this.gimbalGroup);
+          this.rotors = [];
+
+          // Teenage Engineering Premium Design Materials
+          const matBody = new THREE.MeshStandardMaterial({ 
+            color: 0xe6e6e2, // OP-1 Matte Off-Grey/Tan
+            roughness: 0.82, 
+            metalness: 0.10, 
+            flatShading: true 
+          });
+          const matAltPlate = new THREE.MeshStandardMaterial({ 
+            color: 0xd8d8d4, // OP-Z darker grey accent panel
+            roughness: 0.85, 
+            metalness: 0.15, 
+            flatShading: true 
+          });
+          const matDark = new THREE.MeshStandardMaterial({ 
+            color: 0x242424, // Matte Black / Deep Charcoal
+            roughness: 0.90, 
+            metalness: 0.25, 
+            flatShading: true 
+          });
+          const matSilver = new THREE.MeshStandardMaterial({
+            color: 0xcccccc,
+            roughness: 0.3,
+            metalness: 0.8
+          });
+
+          // Teenage Engineering Colors
+          const matLED_GlowOrange = new THREE.MeshStandardMaterial({ color: 0xff3b00, emissive: 0xff3b00, emissiveIntensity: 3.5 });
+          const matLED_GlowGreen  = new THREE.MeshStandardMaterial({ color: 0x39ff14, emissive: 0x39ff14, emissiveIntensity: 2.2 });
+          const matLED_GlowBlue   = new THREE.MeshStandardMaterial({ color: 0x0080ff, emissive: 0x0080ff, emissiveIntensity: 3.0 });
+
+          const matTEOrange = new THREE.MeshStandardMaterial({ color: 0xff3b00, roughness: 0.45, metalness: 0.1 }); // Pure TE Vibrant Red-Orange
+          const matTEYellow = new THREE.MeshStandardMaterial({ color: 0xffcc00, roughness: 0.45, metalness: 0.1 }); // Pure TE Yellow
+          const matTEBlue   = new THREE.MeshStandardMaterial({ color: 0x0080ff, roughness: 0.45, metalness: 0.1 }); // OP-1 Accent Blue
+          const matTEWhite  = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.70, metalness: 0.05 }); // Chalky White
+
+          this.droneLED_Orange = new THREE.MeshStandardMaterial({ color: 0xff3b00, emissive: 0xff3b00, emissiveIntensity: 3.5 });
+          this.droneLED_Green  = new THREE.MeshStandardMaterial({ color: 0x39ff14, emissive: 0x39ff14, emissiveIntensity: 2.0 });
+
+          // 1. CHASSIS / FRAME (Tiered Pocket Sampler Structure)
+          const frameLowerGeo = new THREE.BoxGeometry(0.15, 0.03, 0.30);
+          const frameLower = new THREE.Mesh(frameLowerGeo, matDark);
+          frameLower.position.set(0, -0.015, 0);
+          frameLower.castShadow = true;
+          frameLower.receiveShadow = true;
+          this.drone.add(frameLower);
+
+          // Top Main Plate (TE Cream/Off-grey)
+          const frameUpperGeo = new THREE.BoxGeometry(0.146, 0.015, 0.29);
+          const frameUpper = new THREE.Mesh(frameUpperGeo, matBody);
+          frameUpper.position.set(0, 0.018, 0);
+          frameUpper.castShadow = true;
+          frameUpper.receiveShadow = true;
+          frameLower.add(frameUpper);
+
+          // Panel Divider Groove / Center Seam
+          const grooveGeo = new THREE.BoxGeometry(0.003, 0.016, 0.28);
+          const groove = new THREE.Mesh(grooveGeo, matDark);
+          groove.position.set(0.02, 0.001, 0);
+          frameUpper.add(groove);
+
+          // Corner Fasteners / Screws (Rivet style)
+          const rivetGeo = new THREE.CylinderGeometry(0.0035, 0.0035, 0.016, 12);
+          const rivetMat = matSilver;
+          const rivetsLocations = [
+            { x:  0.065, z:  0.135 },
+            { x: -0.065, z:  0.135 },
+            { x:  0.065, z: -0.135 },
+            { x: -0.065, z: -0.135 },
+          ];
+          rivetsLocations.forEach(loc => {
+            const rMesh = new THREE.Mesh(rivetGeo, rivetMat);
+            rMesh.position.set(loc.x, 0.008, loc.z);
+            frameUpper.add(rMesh);
+
+            // Add center recess/groove in screw for high detail
+            const slotMesh = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.001, 0.001), matDark);
+            slotMesh.position.set(loc.x, 0.016, loc.z);
+            frameUpper.add(slotMesh);
+          });
+
+          // 2. SPEAKER GRILL HOLES (Signature TE Punched Hole Matrix)
+          const holeGeo = new THREE.CylinderGeometry(0.002, 0.002, 0.001, 8);
+          const holeMat = matDark;
+          const startX = 0.035;
+          const startZ = -0.07;
+          for (let r = 0; r < 5; r++) {
+            for (let c = 0; c < 5; c++) {
+              const hM = new THREE.Mesh(holeGeo, holeMat);
+              hM.position.set(startX + r * 0.007, 0.008, startZ + c * 0.007);
+              frameUpper.add(hM);
+            }
+          }
+
+          // Real speaker magnetic driver detail underneath top plate visible/felt by geometry
+          const speakerDriver = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.012, 16), matDark);
+          speakerDriver.position.set(0.049, -0.005, -0.056);
+          frameLower.add(speakerDriver);
+
+          const speakerDome = new THREE.Mesh(new THREE.SphereGeometry(0.006, 8, 8), matSilver);
+          speakerDome.position.set(0.049, 0.002, -0.056);
+          frameLower.add(speakerDome);
+
+          // Helper for constructing dial assemblies with specific collars
+          const knobGroupGroup = (parent, collarMat, capMat) => {
+            const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.01, 0.003, 16), collarMat);
+            collar.position.y = 0.0015;
+            parent.add(collar);
+            const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.007, 0.007, 0.012, 16), capMat);
+            knob.position.y = 0.008;
+            parent.add(knob);
+            const indLine = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.005), collarMat);
+            indLine.position.set(0, 0.0145, -0.003);
+            parent.add(indLine);
+            return parent;
+          };
+
+          // 3. DIALS & KNOBS (From EP-133 K.O. II with Orange, Blue, Yellow collar rings)
+          const knobGroup1 = new THREE.Group();
+          knobGroup1.position.set(-0.035, 0.008, -0.08);
+          frameUpper.add(knobGroupGroup(knobGroup1, matTEOrange, matDark));
+
+          const knobGroup2 = new THREE.Group();
+          knobGroup2.position.set(-0.035, 0.008, -0.03);
+          frameUpper.add(knobGroupGroup(knobGroup2, matTEYellow, matDark));
+
+          const knobGroup3 = new THREE.Group();
+          knobGroup3.position.set(-0.035, 0.008, 0.02);
+          frameUpper.add(knobGroupGroup(knobGroup3, matTEBlue, matTEWhite));
+
+          const knobGroup4 = new THREE.Group();
+          knobGroup4.position.set(-0.035, 0.008, 0.07);
+          frameUpper.add(knobGroupGroup(knobGroup4, matDark, matTEWhite));
+
+          // 4. VERTICAL SLIDER / FLUSH FADER 
+          const faderChannel = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.002, 0.08), matDark);
+          faderChannel.position.set(0.035, 0.008, 0.03);
+          frameUpper.add(faderChannel);
+
+          const faderBody = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.006, 0.025), matAltPlate);
+          faderBody.position.set(0, 0.003, -0.01);
+          faderChannel.add(faderBody);
+          
+          const faderCap = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.004, 0.008), matTEWhite);
+          faderCap.position.set(0, 0.005, 0);
+          faderBody.add(faderCap);
+
+          // 5. ICONIC SAMPLER RUBBER KEYPAD BUTTONS (Grid of colorful trigger pads)
+          const btnGeo = new THREE.BoxGeometry(0.014, 0.006, 0.014);
+          const btnColors = [
+            matDark,    matDark,    matTEWhite,
+            matAltPlate, matAltPlate, matTEOrange,
+            matTEWhite, matDark,    matDark,
+          ];
+          let buttonIdx = 0;
+          for (let zCol = 0; zCol < 3; zCol++) {
+            for (let xCol = 0; xCol < 3; xCol++) {
+              const bMesh = new THREE.Mesh(btnGeo, btnColors[buttonIdx % btnColors.length]);
+              bMesh.position.set(-0.04 + xCol * 0.022, 0.008, 0.09 + zCol * 0.022);
+              bMesh.castShadow = true;
+              frameUpper.add(bMesh);
+              buttonIdx++;
+            }
+          }
+
+          // 6. GLOWING AMBER RETRO LEVEL METER/VU BAR (As seen in K.O. Sidekick)
+          const vuGroup = new THREE.Group();
+          vuGroup.position.set(0.045, 0.008, -0.01);
+          frameUpper.add(vuGroup);
+
+          const segGeo = new THREE.BoxGeometry(0.01, 0.001, 0.003);
+          for (let s = 0; s < 7; s++) {
+            const segMat = (s >= 5) ? matLED_GlowOrange : matLED_GlowGreen;
+            const segment = new THREE.Mesh(segGeo, segMat);
+            segment.position.set(0, 0.001, s * 0.005);
+            vuGroup.add(segment);
+          }
+
+          // 7. HIGH-FIDELITY RETRO GLOSS BLACK LCD SCREEN Readout Panel 
+          const lcdBacking = new THREE.Mesh(new THREE.BoxGeometry(0.065, 0.003, 0.048), matDark);
+          lcdBacking.position.set(0.02, 0.009, -0.115);
+          frameUpper.add(lcdBacking);
+
+          // Glowing 7-segment digital elements ("9 9") inside LCD
+          // Digit 1
+          const segD1_top = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD1_top.position.set(-0.015, 0.011, -0.125);
+          frameUpper.add(segD1_top);
+
+          const segD1_mid = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD1_mid.position.set(-0.015, 0.011, -0.115);
+          frameUpper.add(segD1_mid);
+
+          const segD1_bot = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD1_bot.position.set(-0.015, 0.011, -0.105);
+          frameUpper.add(segD1_bot);
+
+          const segD1_tl = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD1_tl.position.set(-0.018, 0.011, -0.12);
+          frameUpper.add(segD1_tl);
+
+          const segD1_tr = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD1_tr.position.set(-0.012, 0.011, -0.12);
+          frameUpper.add(segD1_tr);
+
+          const segD1_br = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD1_br.position.set(-0.012, 0.011, -0.11);
+          frameUpper.add(segD1_br);
+
+          // Digit 2
+          const segD2_top = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD2_top.position.set(0.005, 0.011, -0.125);
+          frameUpper.add(segD2_top);
+
+          const segD2_mid = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD2_mid.position.set(0.005, 0.011, -0.115);
+          frameUpper.add(segD2_mid);
+
+          const segD2_bot = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.001, 0.002), matLED_GlowOrange);
+          segD2_bot.position.set(0.005, 0.011, -0.105);
+          frameUpper.add(segD2_bot);
+
+          const segD2_tl = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD2_tl.position.set(0.002, 0.011, -0.12);
+          frameUpper.add(segD2_tl);
+
+          const segD2_tr = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD2_tr.position.set(0.008, 0.011, -0.12);
+          frameUpper.add(segD2_tr);
+
+          const segD2_br = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.001, 0.008), matLED_GlowOrange);
+          segD2_br.position.set(0.008, 0.011, -0.11);
+          frameUpper.add(segD2_br);
+
+          // 8. TE POWER SWITCH, WIRE CARRY LOOP & TELESCOPIC RETRO ANTENNA
+          const switchBase = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.01, 0.02), matDark);
+          switchBase.position.set(-0.076, 0, -0.05);
+          frameLower.add(switchBase);
+
+          const switchKnob = new THREE.Mesh(new THREE.BoxGeometry(0.003, 0.006, 0.006), matTEOrange);
+          switchKnob.position.set(-0.002, 0, 0.003);
+          switchBase.add(switchKnob);
+
+          // Wire hanger/carry loop detail on rear edge
+          const carryLoop = new THREE.Mesh(new THREE.TorusGeometry(0.022, 0.003, 8, 24), matTEYellow);
+          carryLoop.rotation.y = Math.PI / 2;
+          carryLoop.position.set(0, -0.005, 0.15);
+          frameLower.add(carryLoop);
+
+          // Telescopic radio antenna element
+          const antennaGroup = new THREE.Group();
+          antennaGroup.position.set(-0.05, -0.005, 0.13);
+          antennaGroup.rotation.set(0.3, 0, -0.2); // elegantly tilted outwards/backwards
+          frameLower.add(antennaGroup);
+
+          const segmentBase = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.04, 8), matDark);
+          segmentBase.position.y = 0.02;
+          antennaGroup.add(segmentBase);
+
+          const segmentMid = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, 0.05, 8), matSilver);
+          segmentMid.position.y = 0.06;
+          antennaGroup.add(segmentMid);
+
+          const segmentTop = new THREE.Mesh(new THREE.CylinderGeometry(0.002, 0.002, 0.06, 8), matSilver);
+          segmentTop.position.y = 0.11;
+          antennaGroup.add(segmentTop);
+
+          const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.004, 8, 8), matTEOrange);
+          antennaTip.position.y = 0.14;
+          antennaGroup.add(antennaTip);
+
+          // Jack plug holes (Tactile connectors)
+          const jackGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.002, 12).rotateZ(Math.PI / 2);
+          const innerJackGeo = new THREE.CylinderGeometry(0.002, 0.002, 0.003, 12).rotateZ(Math.PI / 2);
+          [-0.1, -0.06, -0.02].forEach((offsetZ, i) => {
+            const jackRing = new THREE.Mesh(jackGeo, matSilver);
+            jackRing.position.set(0.076, -0.005, offsetZ);
+            frameLower.add(jackRing);
+
+            const jackHole = new THREE.Mesh(innerJackGeo, matDark);
+            jackHole.position.set(0.077, -0.005, offsetZ);
+            frameLower.add(jackHole);
+          });
+
+          // Mechanical Materials for detailed motors/windings/gimbals
+          const matCopper = new THREE.MeshStandardMaterial({ color: 0xcc7a00, roughness: 0.2, metalness: 0.9 });
+          const matBrass = new THREE.MeshStandardMaterial({ color: 0xddb822, roughness: 0.1, metalness: 0.9 });
+
+          // 9. TE-STYLE ROBUST SKELETAL MOTOR ARMS + PROTECTIVE ROTOR RINGS
+          const positions = [
+            { x: 1, z: 1, spinDir: 1 },
+            { x: -1, z: 1, spinDir: -1 },
+            { x: 1, z: -1, spinDir: -1 },
+            { x: -1, z: -1, spinDir: 1 }
+          ];
+
+          positions.forEach(pos => {
+            const mX = pos.x * 0.14;
+            const mZ = pos.z * 0.16;
+
+            const armGroup = new THREE.Group();
+            frameLower.add(armGroup);
+
+            const rodLength = Math.sqrt(mX*mX + mZ*mZ) * 0.85;
+            
+            const rod1 = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, rodLength, 8).rotateX(Math.PI / 2), matDark);
+            rod1.position.set(mX * 0.45, 0.002, mZ * 0.45);
+            rod1.lookAt(mX, 0, mZ);
+            armGroup.add(rod1);
+
+            const rod2 = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, rodLength, 8).rotateX(Math.PI / 2), matDark);
+            rod2.position.set(mX * 0.45, -0.008, mZ * 0.45);
+            rod2.lookAt(mX, 0, mZ);
+            armGroup.add(rod2);
+
+            for (let dist = 0; dist <= 0.8; dist += 0.25) {
+              const spacer = new THREE.Mesh(new THREE.CylinderGeometry(0.002, 0.002, 0.015, 6), matDark);
+              spacer.position.set(mX * dist, -0.003, mZ * dist);
+              armGroup.add(spacer);
+            }
+
+            // Advanced outrunner brushless motor with cooling fins & visible copper windings
+            const motorCasing = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.035, 16), matDark);
+            motorCasing.position.set(mX, 0.005, mZ);
+            frameLower.add(motorCasing);
+
+            // Silver cooling fin/heat-sink rings on the motor casing
+            for (let f = 0; f < 3; f++) {
+              const fin = new THREE.Mesh(new THREE.TorusGeometry(0.0192, 0.0012, 6, 16), matSilver);
+              fin.rotation.x = Math.PI / 2;
+              fin.position.y = -0.01 + f * 0.008;
+              motorCasing.add(fin);
+            }
+
+            // Expose copper winding assembly inside the motor housing gaps
+            const windingRing = new THREE.Mesh(new THREE.TorusGeometry(0.012, 0.003, 8, 12), matCopper);
+            windingRing.rotation.x = Math.PI / 2;
+            windingRing.position.y = 0.01;
+            motorCasing.add(windingRing);
+
+            for (let pIdx = 0; pIdx < 6; pIdx++) {
+              const poleAngle = (pIdx * Math.PI * 2) / 6;
+              const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.002, 0.002, 0.012, 6), matCopper);
+              pole.position.set(Math.cos(poleAngle) * 0.012, 0.012, Math.sin(poleAngle) * 0.012);
+              motorCasing.add(pole);
+            }
+
+            const capColarMat = pos.z > 0 ? matTEOrange : matAltPlate;
+            const motorCap = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.008, 16), capColarMat);
+            motorCap.position.y = 0.018;
+            motorCasing.add(motorCap);
+
+            // Steel propulsion rotating axle drive shaft
+            const driveShaft = new THREE.Mesh(new THREE.CylinderGeometry(0.0022, 0.0022, 0.02, 8), matSilver);
+            driveShaft.position.y = 0.024;
+            motorCasing.add(driveShaft);
+
+            // Concentric lightweight protective guards
+            const guardRingGeo = new THREE.TorusGeometry(0.09, 0.003, 8, 36);
+            const guardRing = new THREE.Mesh(guardRingGeo, matBody);
+            guardRing.rotation.x = Math.PI / 2;
+            guardRing.position.set(mX, 0.022, mZ);
+            frameLower.add(guardRing);
+
+            for (let a = 0; a < 4; a++) {
+              const angle = (a * Math.PI) / 2 + Math.PI / 4;
+              const braceGeo = new THREE.CylinderGeometry(0.002, 0.002, 0.09, 6).rotateZ(Math.PI / 2);
+              const brace = new THREE.Mesh(braceGeo, matDark);
+              brace.position.set(
+                mX + Math.cos(angle) * 0.045, 
+                0.015, 
+                mZ + Math.sin(angle) * 0.045
+              );
+              brace.rotation.y = -angle;
+              frameLower.add(brace);
+            }
+
+            // Rotor assembly (Propellers with high-density physical layout)
+            const rotorGroup = new THREE.Group();
+            rotorGroup.position.set(0, 0.025, 0);
+            motorCasing.add(rotorGroup);
+
+            const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.01, 12), matSilver);
+            rotorGroup.add(hub);
+
+            // Brass center lock bolt nut/fastener
+            const lockBolt = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.0045, 0.004, 6), matBrass);
+            lockBolt.position.y = 0.006;
+            rotorGroup.add(lockBolt);
+
+            const propGeo = new THREE.CylinderGeometry(0.082, 0.082, 0.001, 32);
+            const propMat = new THREE.MeshBasicMaterial({ 
+                color: 0xcccccc, 
+                transparent: true, 
+                opacity: 0.16, 
+                depthWrite: false 
+            });
+            const prop = new THREE.Mesh(propGeo, propMat);
+            rotorGroup.add(prop);
+            
+            // Dual propeller blades with aerodynamic pitch twist & counterweight rivets
+            const bladeGroup = new THREE.Group();
+            rotorGroup.add(bladeGroup);
+
+            // Left Blade
+            const bladeL = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.002, 0.012), matDark);
+            bladeL.position.set(-0.041, 0, 0);
+            bladeL.rotation.x = 0.12 * pos.spinDir; // aerodynamic twist angle
+            bladeGroup.add(bladeL);
+
+            // Right Blade
+            const bladeR = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.002, 0.012), matDark);
+            bladeR.position.set(0.041, 0, 0);
+            bladeR.rotation.x = -0.12 * pos.spinDir; // aerodynamic twist opposite angle
+            bladeGroup.add(bladeR);
+
+            // Silver counterbalance pins on roots
+            const weightL = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, 0.003, 8), matSilver);
+            weightL.position.set(-0.012, 0.001, 0);
+            bladeGroup.add(weightL);
+
+            const weightR = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, 0.003, 8), matSilver);
+            weightR.position.set(0.012, 0.001, 0);
+            bladeGroup.add(weightR);
+
+            // Colorful TE high-speed tips for visual orientation (Orange for front, White for back)
+            const tipColorMat = pos.z > 0 ? matTEOrange : matTEWhite;
+            const tipL = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.0022, 0.012), tipColorMat);
+            tipL.position.set(-0.075, 0.0001, 0);
+            bladeGroup.add(tipL);
+
+            const tipR = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.0022, 0.012), tipColorMat);
+            tipR.position.set(0.075, 0.0001, 0);
+            bladeGroup.add(tipR);
+
+            rotorGroup.userData.spinDir = pos.spinDir;
+            this.rotors.push(rotorGroup);
+          });
+
+          // 10. FRONT DUAL-AXIS CAMERA GIMBAL & SHOCK-ABSORBER SUSPENSION
+          // Rubber anti-vibration shock dampers
+          const damperGroup = new THREE.Group();
+          damperGroup.position.set(0, 0, -0.14);
+          this.gimbalGroup.add(damperGroup);
+
+          for (let d = 0; d < 4; d++) {
+            const damperAngle = (d * Math.PI) / 2 + Math.PI / 4;
+            const damperBall = new THREE.Mesh(new THREE.SphereGeometry(0.006, 12, 12), matDark);
+            damperBall.position.set(Math.cos(damperAngle) * 0.018, 0.02, Math.sin(damperAngle) * 0.018);
+            damperGroup.add(damperBall);
+          }
+
+          // Left/Right mechanical hinge support brackets for smooth roll/pitch tracking
+          const gimbalHingeL = new THREE.Mesh(new THREE.CylinderGeometry(0.0025, 0.0025, 0.025, 8).rotateZ(Math.PI / 2), matSilver);
+          gimbalHingeL.position.set(-0.028, -0.01, -0.155);
+          this.gimbalGroup.add(gimbalHingeL);
+
+          const gimbalHingeR = new THREE.Mesh(new THREE.CylinderGeometry(0.0025, 0.0025, 0.025, 8).rotateZ(Math.PI / 2), matSilver);
+          gimbalHingeR.position.set(0.028, -0.01, -0.155);
+          this.gimbalGroup.add(gimbalHingeR);
+
+          const gimbalBoxGeo = new THREE.BoxGeometry(0.05, 0.05, 0.06);
+          const gimbalBox = new THREE.Mesh(gimbalBoxGeo, matDark);
+          gimbalBox.position.set(0, -0.01, -0.155);
+          this.gimbalGroup.add(gimbalBox);
+
+          // Exposed micro stepper motor on top for roll stability
+          const rollMotor = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.008, 12).rotateX(Math.PI / 2), matSilver);
+          rollMotor.position.set(0, 0.027, 0.01);
+          gimbalBox.add(rollMotor);
+
+          // Yaw stabilizer bracket structure
+          const stabilizerBracket = new THREE.Mesh(new THREE.TorusGeometry(0.028, 0.0025, 8, 24, Math.PI), matAltPlate);
+          stabilizerBracket.position.set(0, 0, -0.01);
+          gimbalBox.add(stabilizerBracket);
+
+          // Advanced Multi-stage Optic Lens Assembly
+          const lensBarrelOuter = new THREE.Mesh(new THREE.CylinderGeometry(0.023, 0.023, 0.015, 20), matDark);
+          lensBarrelOuter.rotation.x = Math.PI / 2;
+          lensBarrelOuter.position.set(0, 0, -0.032);
+          gimbalBox.add(lensBarrelOuter);
+
+          const lensLockRing = new THREE.Mesh(new THREE.CylinderGeometry(0.021, 0.021, 0.004, 20), matTEYellow);
+          lensLockRing.rotation.x = Math.PI / 2;
+          lensLockRing.position.set(0, 0, -0.039);
+          gimbalBox.add(lensLockRing);
+
+          // White high-precision focal/iris marker alignment notches
+          for (let t = 0; t < 8; t++) {
+            const tAngle = (t * Math.PI * 2) / 8;
+            const tick = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.003, 0.001), matTEWhite);
+            tick.position.set(Math.cos(tAngle) * 0.021, Math.sin(tAngle) * 0.021, -0.035);
+            tick.rotation.z = tAngle;
+            gimbalBox.add(tick);
+          }
+
+          const lensGlassMat = new THREE.MeshStandardMaterial({ 
+            color: 0x051d2d, 
+            roughness: 0.05, 
+            metalness: 0.95,
+            emissive: 0x011525,
+            emissiveIntensity: 0.55
+          });
+          const lensGlass = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.008, 20), lensGlassMat);
+          lensGlass.rotation.x = Math.PI / 2;
+          lensGlass.position.set(0, 0, -0.04);
+          gimbalBox.add(lensGlass);
+
+          const cameraLed = new THREE.Mesh(new THREE.SphereGeometry(0.003, 8, 8), matLED_GlowOrange);
+          cameraLed.position.set(0.016, 0.016, -0.035);
+          gimbalBox.add(cameraLed);
+
+          // Interconnecting Polyimide/Copper flexible flat ribbon cable (TE key visual Detail)
+          const matRibbon = new THREE.MeshStandardMaterial({ color: 0xc27a3a, roughness: 0.35, metalness: 0.6, side: THREE.DoubleSide });
+          
+          const ribbonSeg1 = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.0015, 0.03), matRibbon);
+          ribbonSeg1.position.set(0, 0.01, -0.155);
+          frameUpper.add(ribbonSeg1);
+
+          const ribbonSeg2 = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.0015, 0.025), matRibbon);
+          ribbonSeg2.position.set(0, -0.005, -0.165);
+          ribbonSeg2.rotation.x = Math.PI / 4;
+          frameUpper.add(ribbonSeg2);
+
+          const ribbonSeg3 = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.0015, 0.025), matRibbon);
+          ribbonSeg3.position.set(0, -0.025, -0.168);
+          ribbonSeg3.rotation.x = Math.PI / 2;
+          frameUpper.add(ribbonSeg3);
+
+          // Register a single status LED on top of chassis for compatibility
+          this.statusLed = new THREE.Mesh(new THREE.CylinderGeometry(0.005, 0.005, 0.008, 8), matLED_GlowOrange);
+          this.statusLed.position.set(-0.045, 0.01, -0.11);
+          frameUpper.add(this.statusLed);
+        }
+
+        createTelemetryUI() {
+          this.panel = new xb.SpatialPanel({
+            width: 0.85,
+            height: 0.65,
+            backgroundColor: '#eaeae2f5', // Matte Warm Tan/Off-White
+            useDefaultPosition: false,
+            showEdge: true,
+          });
+
+          this.panel.position.set(-0.5, 1.15, -0.6);
+          this.panel.rotation.set(0.1, 0.25, 0);
+          this.panel.isRoot = true;
+          this.add(this.panel);
+
+          const grid = this.panel.addGrid();
+
+          const headerRow = grid.addRow({ weight: 0.1 });
+          headerRow
+            .addCol({ weight: 0.6 })
+            .addText({
+              text: 'TE-SYNTH // FLIGHT OS',
+              fontColor: '#ff3b00', // Hot TE Orange
+              fontSize: 0.045,
+            });
+          this.bpmText = headerRow
+            .addCol({ weight: 0.4 })
+            .addText({
+              text: 'BPM: 120',
+              fontColor: '#242424', // Deep Slate
+              fontSize: 0.045,
+            });
+
+          const screensRow = grid.addRow({ weight: 0.38 });
+
+          const fpvCol = screensRow.addCol({ weight: 0.48 });
+          this.videoView = fpvCol.addVideo();
+
+          screensRow.addCol({ weight: 0.04 });
+
+          const visCol = screensRow.addCol({ weight: 0.48 });
+          this.visCanvas = document.createElement('canvas');
+          this.visCanvas.width = 512;
+          this.visCanvas.height = 384;
+          this.visCtx = this.visCanvas.getContext('2d');
+          this.visTexture = new THREE.CanvasTexture(this.visCanvas);
+
+          const visMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(0.36, 0.27),
+            new THREE.MeshBasicMaterial({ map: this.visTexture }),
+          );
+          visMesh.position.z = 0.01;
+          visCol.add(visMesh);
+
+          const camCtrlRow = grid.addRow({ weight: 0.1 });
+          camCtrlRow.addCol({ weight: 0.25 }).addTextButton({
+            text: 'PREV CAM',
+            fontSize: 0.02,
+            backgroundColor: '#242424', // Matte Carbon
+            fontColor: '#eaeae2', // Cream
+          }).onTriggered = () => this.cycleCamera(-1);
+
+          this.cameraLabel = camCtrlRow.addCol({ weight: 0.5 }).addText({
+            text: 'Passthrough Lens Active',
+            fontColor: '#0080ff', // Vivid TE Blue
+            fontSize: 0.025,
+          });
+
+          camCtrlRow.addCol({ weight: 0.25 }).addTextButton({
+            text: 'NEXT CAM',
+            fontSize: 0.02,
+            backgroundColor: '#242424',
+            fontColor: '#eaeae2',
+          }).onTriggered = () => this.cycleCamera(1);
+
+          const dataRow = grid.addRow({ weight: 0.1 });
+          this.altText = dataRow
+            .addCol({ weight: 0.33 })
+            .addText({
+              text: 'ALT 0.0m',
+              fontColor: '#242424', // Deep Slate
+              fontSize: 0.04,
+            });
+          this.speedText = dataRow
+            .addCol({ weight: 0.33 })
+            .addText({
+              text: 'SPD 0.0m/s',
+              fontColor: '#242424', // Deep Slate
+              fontSize: 0.04,
+            });
+          this.scoreText = dataRow
+            .addCol({ weight: 0.33 })
+            .addText({ text: 'SCR 000', fontColor: '#ff3b00', fontSize: 0.04 });
+
+          const gestRow = grid.addRow({ weight: 0.08 });
+          this.lGestText = gestRow
+            .addCol({ weight: 0.5 })
+            .addText({
+              text: 'L-HAND: NONE',
+              fontColor: '#757570', // Dull Grey marking
+              fontSize: 0.035,
+            });
+          this.rGestText = gestRow
+            .addCol({ weight: 0.5 })
+            .addText({
+              text: 'R-HAND: NONE',
+              fontColor: '#757570',
+              fontSize: 0.035,
+            });
+
+          grid
+            .addRow({ weight: 0.08 })
+            .addText({
+              text: 'PINCH & DRAG TO FLY | DOUBLE PINCH FOR SCAN',
+              fontColor: '#0080ff', // Vivid TE Blue
+              fontSize: 0.032,
+            });
+
+          this.panel.updateLayouts();
+        }
+
+        createScannerUI() {
+          this.scannerPanel = new xb.SpatialPanel({
+            width: 0.7,
+            height: 0.55,
+            backgroundColor: '#eaeae2f5', // Matte Warm Tan/Off-White
+            useDefaultPosition: false,
+            showEdge: true,
+          });
+
+          this.scannerPanel.position.set(0.5, 1.15, -0.6);
+          this.scannerPanel.rotation.set(0.1, -0.25, 0);
+          this.scannerPanel.isRoot = true;
+          this.add(this.scannerPanel);
+
+          const grid = this.scannerPanel.addGrid();
+
+          grid
+            .addRow({ weight: 0.15 })
+            .addText({
+              text: 'SPATIAL TARGETING',
+              fontColor: '#ff3b00', // Hot TE Orange
+              fontSize: 0.06,
+            });
+          grid
+            .addRow({ weight: 0.1 })
+            .addText({
+              text: 'AGENT ANALYSIS API',
+              fontColor: '#757570',
+              fontSize: 0.035,
+            });
+
+          grid.addRow({ weight: 0.04 });
+
+          const statusRow = grid.addRow({ weight: 0.12 });
+          this.scanStatusText = statusRow
+            .addCol({ weight: 1 })
+            .addText({
+              text: 'STATUS: IDLE',
+              fontColor: '#242424',
+              fontSize: 0.045,
+            });
+
+          this.targetInfoText = grid
+            .addRow({ weight: 0.12 })
+            .addText({
+              text: 'TARGET: NONE',
+              fontColor: '#0080ff', // Vivid TE Blue
+              fontSize: 0.045,
+            });
+
+          grid.addRow({ weight: 0.06 });
+
+          const btnRow = grid.addRow({ weight: 0.18 });
+          this.btnScan = btnRow.addCol({ weight: 1.0 }).addTextButton({
+            text: '[ SPATIAL SCAN ]',
+            fontSize: 0.05,
+            backgroundColor: '#ff3b00',
+            fontColor: '#ffffff',
+          });
+          this.btnScan.onTriggered = () => this.triggerScan();
+
+          grid.addRow({ weight: 0.06 });
+
+          this.aiAnalysisText = grid
+            .addRow({ weight: 0.17 })
+            .addText({
+              text: 'WAITING FOR SCAN DATA...',
+              fontColor: '#757570',
+              fontSize: 0.035,
+            });
+
+          this.copilot.onStatusChange = (status) => {
+            this.aiAnalysisText.setText("CO-PILOT: " + status);
+          };
+
+          this.scannerPanel.updateLayouts();
+        }
+
+        triggerHaptic(intensity, duration) {
+          const session = xb.core.renderer?.xr?.getSession();
+          if (session) {
+            for (const source of session.inputSources) {
+              if (
+                source.gamepad &&
+                source.gamepad.hapticActuators?.length > 0
+              ) {
+                source.gamepad.hapticActuators[0].pulse(intensity, duration);
+              }
+            }
+          }
+        }
+
+        async triggerScan() {
+          if (this.isScanning) return;
+          this.isScanning = true;
+          this.scanCone.visible = true;
+          this.scanStatusText.setText("STATUS: SCANNING ENVIRONMENT...");
+          this.aiAnalysisText.setText("LLM: CAPTURING OPTICAL DATA...");
+
+          const [base64Image] = await Promise.all([
+            this.captureCameraFrame(),
+            new Promise((r) => setTimeout(r, 600)),
+          ]);
+
+          this.scanCone.visible = false;
+          this.isScanning = false;
+
+          const raycaster = new THREE.Raycaster();
+          const worldPos = new THREE.Vector3();
+          const worldDir = new THREE.Vector3();
+          this.fpvCamera.getWorldPosition(worldPos);
+          this.fpvCamera.getWorldDirection(worldDir);
+          raycaster.set(worldPos, worldDir);
+
+          const intersects = raycaster.intersectObjects(
+            this.activeTargets,
+            true,
+          );
+          let distance = 5.0;
+
+          if (intersects.length > 0) {
+            this.scanStatusText.setText("STATUS: TARGET LOCKED");
+            this.triggerHaptic(0.8, 100);
+            distance = intersects[0].distance;
+          } else {
+            this.scanStatusText.setText("STATUS: SCAN COMPLETE");
+            this.triggerHaptic(0.4, 50);
+          }
+
+          this.analyzeWithAI(base64Image, distance);
+        }
+
+        async analyzeWithAI(base64Image, distance) {
+          this.aiAnalysisText.setText("LLM: GENERATING SPATIAL READOUT...");
+          try {
+            const res = await fetch("/api/scan", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ image: base64Image, distance }),
+            });
+
+            if (!res.ok) {
+              throw new Error(`HTTP error! status: ${res.status}`);
+            }
+
+            const data = await res.json();
+            this.aiAnalysisText.setText(`LLM READOUT:\n${data.text}`);
+          } catch (e) {
+            console.error("Analysis Error:", e);
+            this.aiAnalysisText.setText(
+              "LLM OFFLINE. EXTREME RADIATION SUSPECTED.",
+            );
+          }
+        }
+
+        fireLaser() {
+          if (this.time - this.lastFireTime < 0.2) return;
+          this.lastFireTime = this.time;
+
+          this.synth.playLaser();
+          this.triggerHaptic(0.5, 30);
+
+          const poolItem = this.laserPool.find((p) => !p.active);
+          if (poolItem) {
+            const firePos = new THREE.Vector3();
+            this.gimbalGroup.getWorldPosition(firePos);
+            const forwardOffset = new THREE.Vector3(0, 0, -0.2).applyQuaternion(
+              this.drone.quaternion,
+            );
+
+            poolItem.mesh.position.copy(firePos).add(forwardOffset);
+            poolItem.mesh.quaternion.copy(this.drone.quaternion);
+            poolItem.velocity = new THREE.Vector3(0, 0, -1)
+              .applyQuaternion(this.drone.quaternion)
+              .multiplyScalar(10)
+              .add(this.velocity);
+
+            poolItem.active = true;
+            poolItem.age = 0;
+            poolItem.mesh.visible = true;
+          }
+        }
+
+        detectPinch(joints) {
+          if (!joints || !joints["thumb-tip"] || !joints["index-finger-tip"])
+            return false;
+          const thumb = joints["thumb-tip"].position;
+          const index = joints["index-finger-tip"].position;
+          return thumb.distanceTo(index) < 0.015;
+        }
+
+        getInputs(dt) {
+          let target = { throttle: 0, yaw: 0, pitch: 0, roll: 0 };
+
+          if (this.keys.w) target.throttle += 1;
+          if (this.keys.s) target.throttle -= 1;
+          if (this.keys.a) target.yaw += 1;
+          if (this.keys.d) target.yaw -= 1;
+          if (this.keys.up) target.pitch += 1;
+          if (this.keys.down) target.pitch -= 1;
+          if (this.keys.left) target.roll -= 1;
+          if (this.keys.right) target.roll += 1;
+
+          const applyExpo = (val, deadzone = 0.05, power = 2.0) => {
+            const abs = Math.abs(val);
+            if (abs < deadzone) return 0;
+            return (
+              Math.sign(val) *
+              Math.pow((abs - deadzone) / (1.0 - deadzone), power)
+            );
+          };
+
+          const session = xb.core.renderer.xr.getSession();
+          this.gestureL = "NONE";
+          this.gestureR = "NONE";
+
+          let leftJoints = null;
+          let rightJoints = null;
+
+          if (session) {
+            for (const source of session.inputSources) {
+              if (source.gamepad) {
+                const buttons = source.gamepad.buttons;
+                if (!source.gamepad.userData)
+                  source.gamepad.userData = {
+                    btn4Pressed: false,
+                    btn5Pressed: false,
+                  };
+
+                if (source.handedness === "left") {
+                  if (buttons[4] && buttons[4].pressed) {
+                    if (!source.gamepad.userData.btn4Pressed) {
+                      source.gamepad.userData.btn4Pressed = true;
+                      this.triggerScan();
+                    }
+                  } else source.gamepad.userData.btn4Pressed = false;
+
+                  if (buttons[5] && buttons[5].pressed) {
+                    if (!source.gamepad.userData.btn5Pressed) {
+                      source.gamepad.userData.btn5Pressed = true;
+                      this.toggleHUD();
+                    }
+                  } else source.gamepad.userData.btn5Pressed = false;
+                }
+
+                if (source.handedness === "right") {
+                  if (buttons[4] && buttons[4].pressed) {
+                    if (!source.gamepad.userData.btn4Pressed) {
+                      source.gamepad.userData.btn4Pressed = true;
+                      this.fireLaser();
+                    }
+                  } else source.gamepad.userData.btn4Pressed = false;
+
+                  if (buttons[5] && buttons[5].pressed) {
+                    if (!source.gamepad.userData.btn5Pressed) {
+                      source.gamepad.userData.btn5Pressed = true;
+                      this.togglePCAFeed();
+                    }
+                  } else source.gamepad.userData.btn5Pressed = false;
+                }
+              }
+
+              if (
+                source.gamepad &&
+                source.gamepad.axes.length >= 4 &&
+                !source.hand
+              ) {
+                if (source.handedness === "left") {
+                  target.yaw = applyExpo(-source.gamepad.axes[2]);
+                  target.throttle = applyExpo(-source.gamepad.axes[3]);
+                } else if (source.handedness === "right") {
+                  target.roll = applyExpo(source.gamepad.axes[2]);
+                  target.pitch = applyExpo(-source.gamepad.axes[3]);
+                }
+              }
+            }
+
+            if (xb.user.hands?.hands) {
+              let handIndex = 0;
+              for (const source of session.inputSources) {
+                if (source.hand) {
+                  const h = xb.user.hands.hands[handIndex];
+                  if (h && h.joints) {
+                    if (source.handedness === "left") leftJoints = h.joints;
+                    else if (source.handedness === "right")
+                      rightJoints = h.joints;
+                  }
+                  handIndex++;
+                }
+              }
+            }
+          } else if (xb.user.hands?.hands) {
+            leftJoints = xb.user.hands.hands[0]?.joints;
+            rightJoints = xb.user.hands.hands[1]?.joints;
+          }
+
+          if (leftJoints && this.detectPinch(leftJoints)) {
+            const currentPos = leftJoints["index-finger-tip"].position;
+            if (!this.leftPinchOrigin) {
+              this.leftPinchOrigin = currentPos.clone();
+              this.triggerHaptic(0.3, 20);
+              if (!this.audioStarted) {
+                this.resumeAudio();
+              }
+            } else {
+              const deltaY = currentPos.y - this.leftPinchOrigin.y;
+              const deltaX = currentPos.x - this.leftPinchOrigin.x;
+              target.throttle = deltaY * this.joystickSensitivity;
+              target.yaw = -deltaX * this.joystickSensitivity;
+            }
+            this.gestureL = "RC STICK";
+            if (this.leftJoySphere && this.leftJoyTip && this.leftJoyLine) {
+              this.leftJoySphere.position.copy(this.leftPinchOrigin);
+              this.leftJoyTip.position.copy(currentPos);
+              this.leftJoySphere.visible = true;
+              this.leftJoyTip.visible = true;
+              const posAttr = this.leftJoyLine.geometry.attributes.position;
+              posAttr.setXYZ(
+                0,
+                this.leftPinchOrigin.x,
+                this.leftPinchOrigin.y,
+                this.leftPinchOrigin.z,
+              );
+              posAttr.setXYZ(1, currentPos.x, currentPos.y, currentPos.z);
+              posAttr.needsUpdate = true;
+              this.leftJoyLine.visible = true;
+            }
+          } else {
+            this.leftPinchOrigin = null;
+            this.gestureL = "RELEASED";
+            if (this.leftJoySphere) {
+              this.leftJoySphere.visible = false;
+              this.leftJoyTip.visible = false;
+              this.leftJoyLine.visible = false;
+            }
+          }
+
+          if (rightJoints && this.detectPinch(rightJoints)) {
+            const currentPos = rightJoints["index-finger-tip"].position;
+            if (!this.rightPinchOrigin) {
+              this.rightPinchOrigin = currentPos.clone();
+              this.droneStartPos.copy(this.drone.position);
+              this.triggerHaptic(0.3, 20);
+              if (!this.audioStarted) {
+                this.resumeAudio();
+              }
+            }
+
+            if (this.flightMode === "KINETIC") {
+              this.kineticActive = true;
+              const delta = currentPos.clone().sub(this.rightPinchOrigin);
+              this.kineticTarget
+                .copy(this.droneStartPos)
+                .add(delta.multiplyScalar(4.0));
+              this.gestureR = "TELEKINESIS";
+
+              if (this.rightJoySphere && this.rightJoyLine) {
+                this.rightJoySphere.position.copy(this.rightPinchOrigin);
+                this.rightJoySphere.visible = true;
+                const posAttr = this.rightJoyLine.geometry.attributes.position;
+                posAttr.setXYZ(
+                  0,
+                  this.rightPinchOrigin.x,
+                  this.rightPinchOrigin.y,
+                  this.rightPinchOrigin.z,
+                );
+                posAttr.setXYZ(1, currentPos.x, currentPos.y, currentPos.z);
+                posAttr.needsUpdate = true;
+                this.rightJoyLine.visible = true;
+              }
+            } else {
+              this.kineticActive = false;
+              const deltaZ = currentPos.z - this.rightPinchOrigin.z;
+              const deltaX = currentPos.x - this.rightPinchOrigin.x;
+              target.pitch = deltaZ * this.joystickSensitivity;
+              target.roll = deltaX * this.joystickSensitivity;
+              this.gestureR = "RC STICK";
+              if (
+                this.rightJoySphere &&
+                this.rightJoyTip &&
+                this.rightJoyLine
+              ) {
+                this.rightJoySphere.position.copy(this.rightPinchOrigin);
+                this.rightJoyTip.position.copy(currentPos);
+                this.rightJoySphere.visible = true;
+                this.rightJoyTip.visible = true;
+                const posAttr = this.rightJoyLine.geometry.attributes.position;
+                posAttr.setXYZ(
+                  0,
+                  this.rightPinchOrigin.x,
+                  this.rightPinchOrigin.y,
+                  this.rightPinchOrigin.z,
+                );
+                posAttr.setXYZ(1, currentPos.x, currentPos.y, currentPos.z);
+                posAttr.needsUpdate = true;
+                this.rightJoyLine.visible = true;
+              }
+            }
+          } else {
+            this.rightPinchOrigin = null;
+            this.gestureR = "RELEASED";
+            this.kineticActive = false;
+            if (this.rightJoySphere) {
+              this.rightJoySphere.visible = false;
+              this.rightJoyTip.visible = false;
+              this.rightJoyLine.visible = false;
+            }
+          }
+
+          target.throttle = THREE.MathUtils.clamp(target.throttle, -1, 1);
+          target.yaw = THREE.MathUtils.clamp(target.yaw, -1, 1);
+          target.pitch = THREE.MathUtils.clamp(target.pitch, -1, 1);
+          target.roll = THREE.MathUtils.clamp(target.roll, -1, 1);
+
+          const lerpSpeed = 4.0;
+          this.smoothedInputs.throttle = THREE.MathUtils.lerp(
+            this.smoothedInputs.throttle,
+            target.throttle,
+            dt * lerpSpeed,
+          );
+          this.smoothedInputs.yaw = THREE.MathUtils.lerp(
+            this.smoothedInputs.yaw,
+            target.yaw,
+            dt * lerpSpeed,
+          );
+          this.smoothedInputs.pitch = THREE.MathUtils.lerp(
+            this.smoothedInputs.pitch,
+            target.pitch,
+            dt * lerpSpeed,
+          );
+          this.smoothedInputs.roll = THREE.MathUtils.lerp(
+            this.smoothedInputs.roll,
+            target.roll,
+            dt * lerpSpeed,
+          );
+
+          if (Math.abs(this.smoothedInputs.throttle) < 0.01)
+            this.smoothedInputs.throttle = 0;
+          if (Math.abs(this.smoothedInputs.yaw) < 0.01)
+            this.smoothedInputs.yaw = 0;
+          if (Math.abs(this.smoothedInputs.pitch) < 0.01)
+            this.smoothedInputs.pitch = 0;
+          if (Math.abs(this.smoothedInputs.roll) < 0.01)
+            this.smoothedInputs.roll = 0;
+
+          return { inputs: this.smoothedInputs, leftJoints, rightJoints };
+        }
+
+        setupKeyboardControls() {
+          window.addEventListener("mousedown", () => {
+            if (!this.audioStarted) {
+               this.resumeAudio();
+            }
+          });
+          window.addEventListener(
+            "keydown",
+            (e) => {
+              this.handleKey(e, true);
+              if (!this.audioStarted) {
+                this.resumeAudio();
+              }
+            },
+            { passive: false },
+          );
+          window.addEventListener("keyup", (e) => this.handleKey(e, false), {
+            passive: false,
+          });
+        }
+
+        handleKey(e, isDown) {
+          if (
+            [
+              "Space",
+              "ArrowUp",
+              "ArrowDown",
+              "ArrowLeft",
+              "ArrowRight",
+            ].includes(e.code)
+          )
+            e.preventDefault();
+
+          switch (e.code) {
+            case "KeyW":
+              this.keys.w = isDown;
+              break;
+            case "KeyS":
+              this.keys.s = isDown;
+              break;
+            case "KeyA":
+              this.keys.a = isDown;
+              break;
+            case "KeyD":
+              this.keys.d = isDown;
+              break;
+            case "ArrowUp":
+              this.keys.up = isDown;
+              break;
+            case "ArrowDown":
+              this.keys.down = isDown;
+              break;
+            case "ArrowLeft":
+              this.keys.left = isDown;
+              break;
+            case "ArrowRight":
+              this.keys.right = isDown;
+              break;
+            case "KeyC":
+              if (isDown) this.triggerScan();
+              break;
+            case "KeyP":
+              if (isDown) this.togglePCAFeed();
+              break;
+            case "KeyH":
+              if (isDown) this.toggleHUD();
+              break;
+            case "KeyR":
+              if (isDown) this.recallDrone();
+              break;
+            case "KeyM":
+              if (isDown && this.vrManager) {
+                if (this.vrManager.activeWorld === 'temple') {
+                  this.vrManager.exitWorld();
+                } else {
+                  this.vrManager.enterWorld('temple');
+                }
+              }
+              break;
+            case "KeyN":
+              if (isDown && this.vrManager) {
+                if (this.vrManager.activeWorld === 'greek') {
+                  this.vrManager.exitWorld();
+                } else {
+                  this.vrManager.enterWorld('greek');
+                }
+              }
+              break;
+            case "Space":
+              if (isDown) this.fireLaser();
+              break;
+          }
+        }
+
+        updateWristInteraction(leftJoints, rightJoints, dt) {
+          if (!this.wristGroup) return;
+
+          if (leftJoints && leftJoints["wrist"]) {
+            const wristJoint = leftJoints["wrist"];
+            this.wristGroup.position.copy(wristJoint.position);
+            this.wristGroup.quaternion.copy(wristJoint.quaternion);
+
+            this.wristGroup.translateY(0.04);
+            this.wristGroup.translateZ(0.04);
+
+            if (xb.core.camera) {
+              const backOfHandNormal = new THREE.Vector3(
+                0,
+                1,
+                0,
+              ).applyQuaternion(wristJoint.quaternion);
+              const camToWrist = xb.core.camera.position
+                .clone()
+                .sub(wristJoint.position)
+                .normalize();
+
+              if (backOfHandNormal.dot(camToWrist) > 0.4) {
+                this.wristGroup.visible = true;
+                this.wristGroup.scale.lerp(new THREE.Vector3(1, 1, 1), dt * 15);
+              } else {
+                this.wristGroup.scale.lerp(
+                  new THREE.Vector3(0.01, 0.01, 0.01),
+                  dt * 10,
+                );
+                if (this.wristGroup.scale.x < 0.05)
+                  this.wristGroup.visible = false;
+              }
+            }
+
+            if (
+              this.wristGroup.visible &&
+              this.wristGroup.scale.x > 0.8 &&
+              rightJoints &&
+              rightJoints["index-finger-tip"]
+            ) {
+              const indexTip = rightJoints["index-finger-tip"].position;
+
+              for (let btn of this.wristButtons) {
+                const btnWorldPos = new THREE.Vector3();
+                btn.getWorldPosition(btnWorldPos);
+
+                if (
+                  indexTip.distanceTo(btnWorldPos) < 0.015 &&
+                  this.time - this.lastWristPress > 0.5
+                ) {
+                  this.lastWristPress = this.time;
+
+                  btn.position.y = btn.userData.baseHeight - 0.004;
+                  setTimeout(() => {
+                    btn.position.y = btn.userData.baseHeight;
+                  }, 150);
+
+                  this.triggerHaptic(0.5, 30);
+
+                  if (btn.userData.action === "toggleHUD") this.toggleHUD();
+                  if (btn.userData.action === "togglePCA") this.togglePCAFeed();
+                  if (btn.userData.action === "recallDrone") this.recallDrone();
+                  if (btn.userData.action === "toggleFlightMode")
+                    this.toggleFlightMode();
+                  if (btn.userData.action === "toggleCoPilot")
+                    this.toggleCoPilot();
+                }
+              }
+            }
+          } else {
+            this.wristGroup.visible = false;
+          }
+        }
+
+        updateDynamicUI(dt) {
+          if (!xb.core.camera) return;
+          const cam = xb.core.camera;
+          const distL = this.panel.position.distanceTo(cam.position);
+
+          if (distL > 1.8) {
+            const leftOffset = new THREE.Vector3(-0.45, -0.2, -0.6);
+            leftOffset.applyQuaternion(cam.quaternion);
+            const targetLeft = cam.position.clone().add(leftOffset);
+            this.panel.position.lerp(targetLeft, dt * 3);
+
+            const rightOffset = new THREE.Vector3(0.45, -0.2, -0.6);
+            rightOffset.applyQuaternion(cam.quaternion);
+            const targetRight = cam.position.clone().add(rightOffset);
+            this.scannerPanel.position.lerp(targetRight, dt * 3);
+          }
+        }
+
+        update() {
+          let dt = xb.getDeltaTime();
+          if (isNaN(dt) || dt <= 0) dt = 0.016;
+          dt = Math.min(dt, 0.05);
+
+          this.time += dt;
+          this.frameCount++;
+
+          try {
+            if (this.vrManager) {
+              this.vrManager.update(this.time);
+              if (this.drone && this.velocity) {
+                this.vrManager.checkIntersections(this.drone.position, this.velocity);
+              }
+            }
+          } catch(e) { console.error("VR Manager tick error", e); }
+
+          if (this.paintballs) {
+            this.paintballs.forEach((p) => p.update());
+            this.paintballs = this.paintballs.filter((p) => {
+              if (p.children.length === 0) {
+                this.remove(p);
+                if (p.dispose) p.dispose();
+                return false;
+              }
+              return true;
+            });
+          }
+
+          try {
+            if (this.rainParticles) {
+              const leftCamera = xb.getXrCameraLeft() || xb.core.camera;
+              
+              // Constrain clouds horizontally to track viewer cockpit position; rain is handled particle-locally around camera position
+              // this.cloud.position.x = leftCamera.position.x;
+              // this.cloud.position.z = leftCamera.position.z;
+
+              this.rainParticles.update(leftCamera, xb.core.depth);
+              // this.cloud.update(xb.core.camera, xb.core.depth);
+            }
+          } catch(e) { console.error("Rain particles error", e); }
+
+          if (
+            this.currentMode === "AR" &&
+            xb.core.renderer &&
+            xb.core.renderer.xr.isPresenting
+          ) {
+            const frame = xb.core.renderer.xr.getFrame();
+            if (frame && this.hitTestSource) {
+              const refSpace = xb.core.renderer.xr.getReferenceSpace();
+              const hits = frame.getHitTestResults(this.hitTestSource);
+              if (hits.length > 0) {
+                const hit = hits[0];
+                const pose = hit.getPose(refSpace);
+                if (pose) {
+                  this.reticle.visible = true;
+                  this.reticle.matrix.fromArray(pose.transform.matrix);
+
+                  const hitPos = new THREE.Vector3().setFromMatrixPosition(
+                    this.reticle.matrix,
+                  );
+                  this.lastHitPos = hitPos;
+
+                  if (hitPos.y < this.trueGroundLevel) {
+                    this.trueGroundLevel = hitPos.y;
+                  }
+                }
+              } else {
+                this.reticle.visible = false;
+              }
+            }
+          } else {
+            if (this.reticle) this.reticle.visible = false;
+          }
+
+          const { inputs, leftJoints, rightJoints } = this.getInputs(dt);
+
+          this.updateWristInteraction(leftJoints, rightJoints, dt);
+          this.updateDynamicUI(dt);
+
+          const groundLevel =
+            this.currentMode === "AR" ? this.trueGroundLevel : 0.1;
+          const altitude = Math.max(0, this.drone.position.y - groundLevel);
+          const horizontalSpeed = new THREE.Vector2(
+            this.velocity.x,
+            this.velocity.z,
+          ).length();
+
+          // Physics Polish: Realistic idle wobble when hovering
+          if (horizontalSpeed < 0.1 && altitude > 0.1) {
+            this.drone.position.x += Math.sin(this.time * 3) * 0.002 * dt;
+            this.drone.position.z += Math.cos(this.time * 2.5) * 0.002 * dt;
+            this.drone.position.y += Math.sin(this.time * 4) * 0.001 * dt;
+          }
+
+          if (this.audioStarted) {
+            const tiltX = this.drone.rotation.x;
+            const tiltZ = this.drone.rotation.z;
+            this.synth.updateFlightParams(
+              inputs.throttle,
+              horizontalSpeed,
+              tiltX,
+              tiltZ,
+              inputs.yaw,
+              dt,
+            );
+            this.synth.updateParams(altitude);
+            this.currentBPM = this.synth.bpm;
+          }
+
+          this.spawnPropWash(altitude, groundLevel, dt);
+
+          for (let i = this.activeTargets.length - 1; i >= 0; i--) {
+            const target = this.activeTargets[i];
+            target.rotation.x += 1.0 * dt;
+            target.rotation.y += 1.5 * dt;
+
+            if (this.drone) {
+              const distToDrone = this.drone.position.distanceTo(target.position);
+              if (distToDrone < 0.42) {
+                // Drone directly collided with a synth target!
+                this.spawnExplosion(target.position, 0xff3b00);
+                this.remove(target);
+                this.activeTargets.splice(i, 1);
+
+                this.score += 100;
+                if (this.scoreText) this.scoreText.setText(`SCR ${this.score}`);
+                if (this.audioStarted) {
+                  this.synth.playImpact();
+                  this.synth.playSuccess();
+                }
+                this.synth.glitchFactor = Math.min(1.0, this.synth.glitchFactor + 0.35);
+
+                // Spawn 2 new targets when one gets hit
+                this.spawnTarget();
+                this.spawnTarget();
+              }
+            }
+          }
+
+          // Process Particle Engine
+          for (let p of this.particlePool) {
+            if (p.active) {
+              p.mesh.position.addScaledVector(p.vel, dt);
+              p.vel.y -= 9.8 * dt; // Apply gravity to particles
+              p.age += dt;
+              const scale = Math.max(0, 1 - p.age * 2.0);
+              p.mesh.scale.set(scale, scale, scale);
+              if (p.age > 0.5) {
+                p.active = false;
+                p.mesh.visible = false;
+              }
+            }
+          }
+
+          this.laserPool.forEach((poolItem) => {
+            if (!poolItem.active) return;
+
+            poolItem.velocity.y -= 9.81 * dt; // Apply gravity for splash ball
+
+            const startPos = poolItem.mesh.position.clone();
+            poolItem.mesh.position.addScaledVector(poolItem.velocity, dt);
+            const endPos = poolItem.mesh.position.clone();
+            poolItem.age += dt;
+
+            let hitOccurred = false;
+            let hitPoint = null;
+            let hitNormal = null;
+            let hitObj = null;
+            let hitFace = null;
+            let hitTarget = null;
+
+            const dir = endPos.clone().sub(startPos).normalize();
+            const dist = startPos.distanceTo(endPos);
+
+            if (dist > 0.001) {
+              const raycaster = new THREE.Raycaster(startPos, dir, 0, Math.max(dist, 0.05));
+
+              // 1. Check precise physical hit on active synthesizer targets
+              const targetHits = raycaster.intersectObjects(this.activeTargets, true);
+              if (targetHits.length > 0) {
+                const targetHit = targetHits[0];
+                let matchedGroup = targetHit.object;
+                while (matchedGroup && matchedGroup.parent !== this && matchedGroup.parent !== xb.core.scene) {
+                  matchedGroup = matchedGroup.parent;
+                }
+                if (matchedGroup && this.activeTargets.includes(matchedGroup)) {
+                  hitOccurred = true;
+                  hitPoint = targetHit.point;
+                  hitNormal = targetHit.face ? targetHit.face.normal : dir.clone().negate();
+                  hitObj = targetHit.object;
+                  hitFace = targetHit.face;
+                  hitTarget = matchedGroup;
+                }
+              }
+
+              // 2. Fallback check against physical chamber surfaces (purely virtual fast checks)
+              if (!hitOccurred) {
+                let collidablesToCheck = [...this.collidableSurfaces];
+                let allHits = [];
+                if (collidablesToCheck.length > 0) {
+                  allHits.push(...raycaster.intersectObjects(collidablesToCheck, true));
+                }
+                
+                // Explicitly check depthMesh for real-world geometry collisions in AR
+                if (xb.core.depth && xb.core.depth.depthMesh) {
+                  const dm = xb.core.depth.depthMesh;
+                  if (dm) {
+                    const oldVisible = dm.visible;
+                    dm.visible = true; // Briefly make visible so Raycaster can see it
+                    allHits.push(...raycaster.intersectObject(dm, false));
+                    dm.visible = oldVisible;
+                  }
+                }
+
+                if (allHits.length > 0) {
+                  allHits.sort((a, b) => a.distance - b.distance);
+                  hitOccurred = true;
+                  hitPoint = allHits[0].point;
+                  hitNormal = allHits[0].face ? allHits[0].face.normal : dir.clone().negate();
+                  hitObj = allHits[0].object;
+                  hitFace = allHits[0].face;
+                  hitTarget = null;
+                }
+              }
+            }
+            
+            // 3. Fallback to WebXR Hit Test system explicit plane hit matches
+            if (!hitOccurred && this.lastHitPos) {
+               if (endPos.distanceTo(this.lastHitPos) < 0.2) {
+                 hitOccurred = true;
+                 hitPoint = this.lastHitPos.clone();
+                 hitNormal = poolItem.velocity.clone().negate().normalize();
+               }
+            }
+
+            if (hitOccurred) {
+              poolItem.active = false;
+              poolItem.mesh.visible = false;
+
+              // Handle synthesizer score target destruction first
+              if (hitTarget) {
+                this.spawnExplosion(hitPoint, poolItem.color);
+                this.remove(hitTarget);
+                const idx = this.activeTargets.indexOf(hitTarget);
+                if (idx > -1) this.activeTargets.splice(idx, 1);
+                
+                this.score += 100;
+                if (this.scoreText) this.scoreText.setText(`SCR ${this.score}`);
+                if (this.audioStarted) this.synth.playSuccess();
+                this.synth.glitchFactor = Math.min(1.0, this.synth.glitchFactor + 0.35);
+
+                this.spawnTarget();
+                this.spawnTarget();
+                return;
+              }
+
+              // Handle general environmental paint splatting
+              if (!this.paintballs) this.paintballs = [];
+              try {
+                const listener = this.listener || null;
+                const paintball = new PaintSplash(
+                  listener,
+                  poolItem.color || palette.getRandomLiteGColor(),
+                );
+
+                let direction = hitNormal.clone();
+
+                if (hitObj && hitObj.quaternion && hitFace) {
+                  const worldQuat = hitObj.getWorldQuaternion(new THREE.Quaternion());
+                  if (!isNaN(worldQuat.x) && !isNaN(worldQuat.y) && !isNaN(worldQuat.z) && !isNaN(worldQuat.w)) {
+                    direction.applyQuaternion(worldQuat);
+                    direction.normalize();
+                  }
+                }
+
+                const srcVec = new THREE.Vector3(0.0, 0.0, -1.0); // decal looks along -Z by default
+                if (srcVec.dot(direction) < -0.999) {
+                  direction.set(0.001, 0.001, -1.0).normalize();
+                }
+
+                const orientation = new THREE.Quaternion().setFromUnitVectors(
+                  srcVec,
+                  direction,
+                );
+
+                const randomRotation = new THREE.Matrix4().makeRotationZ(
+                  Math.random() * Math.PI * 2,
+                );
+                orientation.multiply(
+                  new THREE.Quaternion().setFromRotationMatrix(randomRotation),
+                );
+
+                if (isNaN(orientation.x) || isNaN(orientation.y) || isNaN(orientation.z) || isNaN(orientation.w) ||
+                    !isFinite(orientation.x) || !isFinite(orientation.y) || !isFinite(orientation.z) || !isFinite(orientation.w)) {
+                  orientation.set(0, 0, 0, 1);
+                }
+
+                const safeHitPoint = hitPoint ? hitPoint.clone() : new THREE.Vector3(0, 0, 0);
+                if (isNaN(safeHitPoint.x) || isNaN(safeHitPoint.y) || isNaN(safeHitPoint.z)) {
+                  safeHitPoint.set(0, 0, 0);
+                }
+
+                // Create high-fidelity splatter, micro-dots, wall dripping streams, and sound effects!
+                paintball.splatOnMesh(
+                  hitObj,
+                  safeHitPoint,
+                  orientation,
+                  0.20,
+                );
+
+                this.add(paintball);
+                this.paintballs.push(paintball);
+              } catch (e) {
+                console.error("Splat error: ", e);
+              }
+              return;
+            }
+
+            if (poolItem.age > 2.0) {
+              poolItem.active = false;
+              poolItem.mesh.visible = false;
+            }
+          });
+
+          this.rotors.forEach((r) => {
+            let speed = 30;
+            if (this.rotorGlitchActive > 0.1) {
+              speed = 5 + Math.sin(this.time * 60) * 18; // Fluttering/sputtering rotor speed
+            }
+            r.rotation.y += speed * r.userData.spinDir * dt;
+          });
+
+          const maxTilt = Math.PI / 5.5;
+
+          if (this.flightMode === "KINETIC" && this.kineticActive) {
+            const distance = this.kineticTarget.distanceTo(this.drone.position);
+            const direction = this.kineticTarget
+              .clone()
+              .sub(this.drone.position)
+              .normalize();
+
+            const SPRING_CONSTANT = 15.0;
+            const DAMPING = 5.0;
+
+            const springForce = direction.multiplyScalar(
+              distance * SPRING_CONSTANT,
+            );
+            const dampingForce = this.velocity.clone().multiplyScalar(-DAMPING);
+
+            const totalForce = springForce.add(dampingForce);
+
+            this.velocity.addScaledVector(totalForce, dt);
+
+            this.drone.rotation.x = THREE.MathUtils.lerp(
+              this.drone.rotation.x,
+              this.velocity.z * 0.15,
+              6 * dt,
+            );
+            this.drone.rotation.z = THREE.MathUtils.lerp(
+              this.drone.rotation.z,
+              -this.velocity.x * 0.15,
+              6 * dt,
+            );
+
+            this.velocity.multiplyScalar(Math.pow(0.1, dt)); // Higher drag in kinetic mode
+            this.drone.position.addScaledVector(this.velocity, dt);
+
+            // Yaw follows velocity vector slowly
+            if (this.velocity.lengthSq() > 0.1) {
+              const targetYaw = Math.atan2(-this.velocity.x, -this.velocity.z);
+              let diff = targetYaw - this.drone.rotation.y;
+              while (diff < -Math.PI) diff += Math.PI * 2;
+              while (diff > Math.PI) diff -= Math.PI * 2;
+              this.drone.rotation.y += diff * 2.0 * dt;
+            }
+
+            if (this.gimbalGroup) {
+              this.gimbalGroup.rotation.x = -this.drone.rotation.x;
+              this.gimbalGroup.rotation.z = -this.drone.rotation.z;
+            }
+          } else {
+            this.drone.rotation.y -= inputs.yaw * 2.5 * dt;
+            this.drone.rotation.x = THREE.MathUtils.lerp(
+              this.drone.rotation.x,
+              -inputs.pitch * maxTilt,
+              6 * dt,
+            );
+            this.drone.rotation.z = THREE.MathUtils.lerp(
+              this.drone.rotation.z,
+              -inputs.roll * maxTilt,
+              6 * dt,
+            );
+
+            if (this.gimbalGroup) {
+              this.gimbalGroup.rotation.x = -this.drone.rotation.x;
+              this.gimbalGroup.rotation.z = -this.drone.rotation.z;
+            }
+
+            const thrust =
+              Math.abs(-9.81) /
+                Math.max(
+                  0.5,
+                  Math.cos(this.drone.rotation.x) *
+                    Math.cos(this.drone.rotation.z),
+                ) +
+              inputs.throttle * 20.0;
+            const force = new THREE.Vector3(0, thrust, 0).applyEuler(
+              this.drone.rotation,
+            );
+            force.y -= 9.81;
+            this.velocity.addScaledVector(force, dt);
+            this.velocity.multiplyScalar(Math.pow(0.05, dt));
+
+            if (
+              Math.abs(inputs.throttle) < 0.1 &&
+              Math.abs(inputs.pitch) < 0.1 &&
+              Math.abs(inputs.roll) < 0.1 &&
+              this.drone.position.y > groundLevel + 0.1
+            ) {
+              this.velocity.y += Math.sin(this.time * 5) * 0.02 * dt;
+            }
+            this.drone.position.addScaledVector(this.velocity, dt);
+          }
+
+                    // Random droplets hitting the FPV camera lens
+          if (this.currentMode !== 'AR') { // Ensure we are flying
+             if (Math.random() < 0.05 * this.velocity.length()) { // More drops when flying fast
+                const dropMat = new THREE.MeshBasicMaterial({ color: 0xccffff, transparent: true, opacity: 0.25 });
+                const dropScale = Math.random() * 0.003 + 0.001;
+                const dropGeo = new THREE.CircleGeometry(dropScale, 12);
+                const drop = new THREE.Mesh(dropGeo, dropMat);
+                
+                // Random position on the 'lens'
+                drop.position.set((Math.random() - 0.5) * 0.08, (Math.random() - 0.5) * 0.06, 0);
+                drop.userData.vy = -0.01 - Math.random() * 0.02; // Slow drag down
+                drop.userData.age = 0;
+                
+                if (this.lensOverlayGroup) {
+                    this.lensOverlayGroup.add(drop);
+                    if (!this.lensDrops) this.lensDrops = [];
+                    this.lensDrops.push(drop);
+                }
+             }
+             
+             if (this.lensDrops) {
+                for (let i = this.lensDrops.length - 1; i >= 0; i--) {
+                   const d = this.lensDrops[i];
+                   d.position.y += d.userData.vy * dt;
+                   d.userData.age += dt;
+                   d.scale.x = Math.max(0.01, 1.0 - d.userData.age * 0.5); // Shrink horizontal (streak)
+                   d.scale.y += dt; // Stretch vertical
+                   d.material.opacity -= dt * 0.2;
+                   if (d.material.opacity <= 0) {
+                      this.lensOverlayGroup.remove(d);
+                      this.lensDrops.splice(i, 1);
+                   }
+                }
+             }
+          }
+          
+          // Nanite auto-repairs and glitch decay
+          this.systemIntegrity = Math.min(100, this.systemIntegrity + dt * 6.5);
+          this.rotorGlitchActive = Math.max(
+            0,
+            this.rotorGlitchActive - dt * 2.0,
+          );
+
+          if (this.drone.position.y <= groundLevel) {
+            if (this.velocity.y < -0.8) {
+              if (this.audioStarted) this.synth.playImpact();
+              this.triggerHaptic(1.0, 200);
+
+              // Trigger crash damage mechanics
+              const damage = Math.floor(20 + Math.abs(this.velocity.y) * 15);
+              this.systemIntegrity = Math.max(0, this.systemIntegrity - damage);
+
+              this.synth.glitchFactor = 1.0;
+              this.rotorGlitchActive = 1.0;
+
+              // Spark impact explosion underneath the drone!
+              this.spawnExplosion(this.drone.position);
+            }
+            this.drone.position.y = groundLevel;
+            this.velocity.y = Math.max(this.velocity.y, 0);
+            this.velocity.x *= 0.5;
+            this.velocity.z *= 0.5;
+            this.drone.rotation.x = THREE.MathUtils.lerp(
+              this.drone.rotation.x,
+              0,
+              Math.min(15 * dt, 1),
+            );
+            this.drone.rotation.z = THREE.MathUtils.lerp(
+              this.drone.rotation.z,
+              0,
+              Math.min(15 * dt, 1),
+            );
+          }
+
+          // Cybernetic screen vibration/shake on heavy glitching
+          if (this.synth && this.synth.glitchFactor > 0.1) {
+            const gf = this.synth.glitchFactor;
+            const shake = (Math.random() - 0.5) * 0.012 * gf;
+            this.panel.position.x += shake;
+            this.panel.position.y += shake;
+            this.scannerPanel.position.x += shake;
+            this.scannerPanel.position.y += shake;
+          }
+
+          if (this.altText && this.speedText) {
+            this.altText.setText(`ALT ${altitude.toFixed(2)}m`);
+            this.speedText.setText(`SPD ${horizontalSpeed.toFixed(2)}m/s`);
+
+            const sysStatus =
+              this.systemIntegrity < 100
+                ? `REPAIRING: ${Math.floor(this.systemIntegrity)}%`
+                : `SYS: NOMINAL`;
+            this.bpmText.setText(
+              `BPM: ${Math.round(this.currentBPM)} | ${sysStatus}`,
+            );
+          }
+          if (this.lGestText && this.rGestText) {
+            this.lGestText.setText(`L-HAND: ${this.gestureL}`);
+            this.rGestText.setText(`R-HAND: ${this.gestureR}`);
+          }
+
+          if (this.visCtx && this.frameCount % 2 === 0) {
+            this.visCtx.fillStyle = "#050a08";
+            this.visCtx.fillRect(
+              0,
+              0,
+              this.visCanvas.width,
+              this.visCanvas.height,
+            );
+
+            if (this.pcaEnabled) {
+              const sweepY = (this.time * 200) % this.visCanvas.height;
+              this.visCtx.fillStyle = "rgba(0, 255, 163, 0.08)";
+              this.visCtx.fillRect(0, 0, this.visCanvas.width, sweepY);
+              this.visCtx.strokeStyle = "rgba(0, 255, 163, 0.4)";
+              this.visCtx.lineWidth = 1;
+              this.visCtx.beginPath();
+              this.visCtx.moveTo(0, sweepY);
+              this.visCtx.lineTo(this.visCanvas.width, sweepY);
+              this.visCtx.stroke();
+              this.visCtx.fillStyle = "#00ffa3";
+              this.visCtx.font = "bold 24px Courier New";
+              this.visCtx.fillText("● PCA CAMERA FEED ACTIVE", 20, 35);
+            } else if (this.audioStarted && this.synth.analyser) {
+              this.synth.analyser.getByteFrequencyData(this.synth.dataArray);
+              const barWidth =
+                this.visCanvas.width / this.synth.analyser.frequencyBinCount;
+              for (
+                let i = 0, x = 0;
+                i < this.synth.analyser.frequencyBinCount;
+                i++, x += barWidth
+              ) {
+                const barHeight =
+                  (this.synth.dataArray[i] / 255) *
+                  this.visCanvas.height *
+                  0.85;
+                this.visCtx.fillStyle = "#ff4a00";
+                this.visCtx.fillRect(
+                  x,
+                  this.visCanvas.height - barHeight,
+                  barWidth - 2,
+                  barHeight,
+                );
+              }
+            }
+            this.visTexture.needsUpdate = true;
+          }
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        const options = new xb.Options();
+        options.enableUI();
+        options.enableXRTransitions();
+        options.enableHands();
+        options.hands.enabled = true;
+        options.hands.visualization = true;
+        options.controllers.visualizeRays = true;
+        options.enableCamera();
+
+        options.depth = new xb.DepthOptions(xb.xrDepthMeshPhysicsOptions);
+        options.depth.depthMesh.colliderUpdateFps = 30;
+
+        options.setAppTitle("Multiverse TE Drone MVP3");
+        xb.add(new DroneSimulator());
+        xb.init(options);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "Remix: Remix2: VR DRONE ACTION",
+  "description": "",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
