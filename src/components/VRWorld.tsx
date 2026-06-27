@@ -1,8 +1,8 @@
 import { useRef, useState, useMemo, useEffect } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { XR, createXRStore, useXR } from '@react-three/xr';
 import { Physics, RigidBody } from '@react-three/rapier';
-import { Sky, Environment, Text, ContactShadows, useCursor, Stars, Sparkles, Float } from '@react-three/drei';
+import { Sky, Environment, Text, ContactShadows, useCursor, Stars, Sparkles, Float, Billboard } from '@react-three/drei';
 import type { RapierRigidBody } from '@react-three/rapier';
 import SciFiTerrain from './Terrain';
 import * as THREE from 'three';
@@ -174,6 +174,332 @@ function FloatingMonolith({ position }: { position: [number, number, number] }) 
   );
 }
 
+import { useMissionStore } from '../store/missionStore';
+
+function HUDOverlay() {
+  const { gl, camera } = useThree();
+  const hudRef = useRef<THREE.Group>(null!);
+  
+  const textAltitudeRef = useRef<any>(null!);
+  const textBatteryRef = useRef<any>(null!);
+  const barBatteryRef = useRef<THREE.Mesh>(null!);
+  const barBatteryMatRef = useRef<THREE.MeshBasicMaterial>(null!);
+  const threatMatRef = useRef<THREE.MeshBasicMaterial>(null!);
+  const altIndicatorRef = useRef<THREE.Mesh>(null!);
+  
+  const batteryRef = useRef(100);
+  
+  const lastVelocityRef = useRef(new THREE.Vector3());
+  const lastPositionRef = useRef(new THREE.Vector3());
+  const textGForceRef = useRef<any>(null!);
+
+  const { showGForce, addLog, addDistance, updateMaxSpeed, addFlightTime, setBatteryDepleted, batteryDepleted } = useMissionStore();
+
+  const loggedBatteryLow = useRef(false);
+  const loggedProximity = useRef(0);
+
+  useFrame((state, delta) => {
+    if (hudRef.current) {
+      // Use WebXR camera if presenting, otherwise use standard camera
+      const activeCamera = gl.xr.isPresenting ? gl.xr.getCamera() : camera;
+      hudRef.current.position.copy(activeCamera.position);
+      hudRef.current.quaternion.copy(activeCamera.quaternion);
+
+      // --- Altitude Gauge ---
+      const alt = Math.max(0, activeCamera.position.y);
+      if (textAltitudeRef.current) {
+        textAltitudeRef.current.text = `ALT\n${alt.toFixed(1)}m`;
+      }
+      if (altIndicatorRef.current) {
+        // Map altitude 0-5m to gauge -0.1 to 0.1
+        const mappedY = THREE.MathUtils.clamp((alt / 5.0) * 0.2 - 0.1, -0.1, 0.1);
+        altIndicatorRef.current.position.y = mappedY;
+      }
+
+      if (!batteryDepleted) {
+        addFlightTime(delta);
+        
+        // --- Battery Status ---
+        batteryRef.current = Math.max(0, batteryRef.current - delta * 1.5); // Deplete 1.5% per second
+        
+        if (batteryRef.current <= 0) {
+          setBatteryDepleted(true);
+          addLog("SYSTEM FAILURE: Battery depleted.");
+        } else if (batteryRef.current < 20 && !loggedBatteryLow.current) {
+          loggedBatteryLow.current = true;
+          addLog("WARNING: Low battery power detected.");
+        }
+      }
+
+      if (textBatteryRef.current) {
+        textBatteryRef.current.text = `PWR: ${batteryRef.current.toFixed(0)}%`;
+      }
+
+      if (barBatteryRef.current) {
+        // Bar is 0.1 wide. scale x based on battery percentage.
+        const scaleX = batteryRef.current / 100;
+        barBatteryRef.current.scale.x = scaleX;
+        // Position it so it shrinks towards the left
+        barBatteryRef.current.position.x = 0.15 - (0.1 * (1 - scaleX)) / 2;
+      }
+
+      if (barBatteryMatRef.current) {
+        if (batteryRef.current < 20) {
+          // Blink red
+          const isBlink = Math.floor(state.clock.elapsedTime * 5) % 2 === 0;
+          barBatteryMatRef.current.color.setHex(isBlink ? 0xff0044 : 0x550000);
+        } else {
+          barBatteryMatRef.current.color.setHex(0x00ffc8); // normal green
+        }
+      }
+
+      // --- Threat Proximity Indicator ---
+      // Simulate proximity based on altitude (closer to ground = higher threat)
+      let threatLevel = 0; // 0 (safe) to 1 (danger)
+      if (alt < 1.0) {
+        threatLevel = 1.0 - alt; // danger increases as we approach 0
+      } else {
+        // Also add some oscillation based on time to simulate scanning
+        threatLevel = (Math.sin(state.clock.elapsedTime * 2) * 0.5 + 0.5) * 0.2; 
+      }
+      
+      if (threatLevel > 0.8 && state.clock.elapsedTime - loggedProximity.current > 5) {
+        loggedProximity.current = state.clock.elapsedTime;
+        addLog(`CRITICAL: Proximity alert triggered. Altitude: ${alt.toFixed(1)}m`);
+      }
+      
+      // Interpolate color from green to red
+      if (threatMatRef.current) {
+        const colorSafe = new THREE.Color(0x00ffc8);
+        const colorDanger = new THREE.Color(0xff0044);
+        threatMatRef.current.color.lerpColors(colorSafe, colorDanger, threatLevel);
+      }
+
+      // --- G-Force & Stats ---
+      if (delta > 0 && delta < 0.1 && !batteryDepleted) { // Avoid huge spikes on lag
+        const currentPos = activeCamera.position;
+        // Velocity = change in position / time
+        const currentVel = new THREE.Vector3().subVectors(currentPos, lastPositionRef.current).divideScalar(delta);
+        const speed = currentVel.length();
+        updateMaxSpeed(speed);
+        addDistance(speed * delta);
+        
+        // Acceleration = change in velocity / time
+        const currentAcc = new THREE.Vector3().subVectors(currentVel, lastVelocityRef.current).divideScalar(delta);
+
+        // Calculate local axes relative to camera
+        const up = new THREE.Vector3(0, 1, 0).applyQuaternion(activeCamera.quaternion);
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(activeCamera.quaternion);
+        
+        // Assume 1G = 9.81 units/s^2. Add 1.0G to vertical to account for gravity.
+        const verticalG = currentAcc.dot(up) / 9.81 + 1.0;
+        const lateralG = currentAcc.dot(right) / 9.81;
+
+        if (textGForceRef.current && showGForce) {
+          textGForceRef.current.text = `G-FRC\nLAT: ${lateralG.toFixed(1)}G\nVERT: ${verticalG.toFixed(1)}G`;
+        } else if (textGForceRef.current && !showGForce) {
+          textGForceRef.current.text = '';
+        }
+
+        // Detect high-G maneuvers to log
+        if (Math.abs(verticalG) > 3.0 || Math.abs(lateralG) > 3.0) {
+          // Prevent log spamming by tracking time in a ref
+          // For simplicity we just add it to a local variable and only log occasionally, or use the proximity cooldown approach
+          // Let's add a quick hack to only log occasionally
+          if (state.clock.elapsedTime - (hudRef.current.userData.lastHighGLog || 0) > 3) {
+            hudRef.current.userData.lastHighGLog = state.clock.elapsedTime;
+            addLog(`High-G Maneuver: ${Math.max(Math.abs(verticalG), Math.abs(lateralG)).toFixed(1)}G`);
+          }
+        }
+
+        lastVelocityRef.current.copy(currentVel);
+        lastPositionRef.current.copy(currentPos);
+      }
+    }
+  });
+
+  return (
+    <group ref={hudRef}>
+      {/* Positioned slightly in front of the camera */}
+      <group position={[0, 0, -1]}>
+        {/* Reticle Inner Ring */}
+        <mesh>
+          <ringGeometry args={[0.02, 0.025, 32]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.6} side={THREE.DoubleSide} depthTest={false} />
+        </mesh>
+
+        {/* Reticle Outer Dashed Ring (Approximated with a slightly larger ring) */}
+        <mesh>
+          <ringGeometry args={[0.04, 0.042, 32, 1, 0, Math.PI * 2]} />
+          <meshBasicMaterial color="#ff0044" transparent opacity={0.3} side={THREE.DoubleSide} depthTest={false} />
+        </mesh>
+        
+        {/* Status text Left */}
+        <Text position={[-0.2, 0.1, 0]} fontSize={0.02} color="#00ffc8" anchorX="left" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          SYS_ONLINE
+        </Text>
+        <Text position={[-0.2, 0.07, 0]} fontSize={0.015} color="#00f3ff" anchorX="left" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          TGT_LOCK: ACTIVE
+        </Text>
+
+        {/* Threat Proximity Indicator */}
+        <Text position={[-0.2, 0.04, 0]} fontSize={0.012} color="#ffffff" anchorX="left" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          PROXIMITY WRN
+        </Text>
+        <mesh position={[-0.16, 0.025, 0]}>
+          <planeGeometry args={[0.08, 0.008]} />
+          <meshBasicMaterial ref={threatMatRef} color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+        </mesh>
+
+        {/* G-Force Meter */}
+        <Text ref={textGForceRef} position={[-0.2, 0.0, 0]} fontSize={0.012} color="#00ffc8" anchorX="left" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          G-FRC
+        </Text>
+        
+        {/* Status text Right */}
+        <Text position={[0.2, 0.1, 0]} fontSize={0.02} color="#00ffc8" anchorX="right" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          DRONE_01
+        </Text>
+        <Text ref={textBatteryRef} position={[0.2, 0.07, 0]} fontSize={0.015} color="#00f3ff" anchorX="right" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+          PWR: 100%
+        </Text>
+
+        {/* Battery Bar Background */}
+        <mesh position={[0.15, 0.05, 0]}>
+           <planeGeometry args={[0.1, 0.008]} />
+           <meshBasicMaterial color="#333333" transparent opacity={0.6} depthTest={false} />
+        </mesh>
+        {/* Battery Bar Foreground */}
+        <mesh ref={barBatteryRef} position={[0.15, 0.05, 0]}>
+           <planeGeometry args={[0.1, 0.008]} />
+           <meshBasicMaterial ref={barBatteryMatRef} color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+        </mesh>
+
+        {/* Altitude Vertical Gauge (Right Side) */}
+        <group position={[0.28, 0, 0]}>
+          {/* Gauge Background Line */}
+          <mesh position={[0, 0, 0]}>
+             <planeGeometry args={[0.005, 0.2]} />
+             <meshBasicMaterial color="#333333" transparent opacity={0.6} depthTest={false} />
+          </mesh>
+          {/* Gauge Indicator Dash */}
+          <mesh ref={altIndicatorRef} position={[0, 0, 0]}>
+             <planeGeometry args={[0.015, 0.005]} />
+             <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+          {/* Gauge Ticks */}
+          {[-0.1, -0.05, 0, 0.05, 0.1].map((y, i) => (
+            <mesh key={i} position={[-0.005, y, 0]}>
+               <planeGeometry args={[0.005, 0.002]} />
+               <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+            </mesh>
+          ))}
+          <Text ref={textAltitudeRef} position={[-0.02, 0, 0]} fontSize={0.012} color="#00ffc8" anchorX="right" anchorY="middle" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+            ALT
+          </Text>
+        </group>
+        
+        {/* HUD Frame Corners */}
+        {/* Top Left */}
+        <mesh position={[-0.3, 0.2, 0]}>
+          <planeGeometry args={[0.05, 0.005]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        <mesh position={[-0.3225, 0.1775, 0]}>
+          <planeGeometry args={[0.005, 0.05]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        {/* Top Right */}
+        <mesh position={[0.3, 0.2, 0]}>
+          <planeGeometry args={[0.05, 0.005]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        <mesh position={[0.3225, 0.1775, 0]}>
+          <planeGeometry args={[0.005, 0.05]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        {/* Bottom Left */}
+        <mesh position={[-0.3, -0.2, 0]}>
+          <planeGeometry args={[0.05, 0.005]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        <mesh position={[-0.3225, -0.1775, 0]}>
+          <planeGeometry args={[0.005, 0.05]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        {/* Bottom Right */}
+        <mesh position={[0.3, -0.2, 0]}>
+          <planeGeometry args={[0.05, 0.005]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+        <mesh position={[0.3225, -0.1775, 0]}>
+          <planeGeometry args={[0.005, 0.05]} />
+          <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+function Waypoints() {
+  const { gl, camera } = useThree();
+  
+  // List of waypoint positions
+  const waypoints = useMemo(() => [
+    new THREE.Vector3(10, 5, -20),
+    new THREE.Vector3(-15, 8, -40),
+    new THREE.Vector3(5, 2, -60),
+  ], []);
+
+  // Calculate distance from active camera to each waypoint
+  const textRefs = useRef<any[]>([]);
+
+  useFrame(() => {
+    const activeCamera = gl.xr.isPresenting ? gl.xr.getCamera() : camera;
+    waypoints.forEach((wp, index) => {
+      if (textRefs.current[index]) {
+        const distance = activeCamera.position.distanceTo(wp);
+        textRefs.current[index].text = `WP-0${index + 1}\n${distance.toFixed(1)}m`;
+      }
+    });
+  });
+
+  return (
+    <>
+      {waypoints.map((wp, index) => (
+        <group key={index} position={wp}>
+          {/* A floating diamond indicator */}
+          <Float speed={2} rotationIntensity={0.5} floatIntensity={0.5}>
+            <mesh>
+              <octahedronGeometry args={[0.5, 0]} />
+              <meshBasicMaterial color="#00ffc8" wireframe />
+            </mesh>
+            <mesh>
+              <octahedronGeometry args={[0.2, 0]} />
+              <meshBasicMaterial color="#00ffc8" transparent opacity={0.6} />
+            </mesh>
+            
+            {/* The distance text always faces the camera */}
+            <Billboard position={[0, 1.2, 0]}>
+              <Text 
+                ref={(el) => textRefs.current[index] = el}
+                fontSize={0.4} 
+                color="#00f3ff" 
+                font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff"
+                anchorX="center"
+                anchorY="middle"
+                textAlign="center"
+              >
+                {`WP-0${index + 1}\n---m`}
+              </Text>
+            </Billboard>
+          </Float>
+        </group>
+      ))}
+    </>
+  );
+}
+
 // Scene rendering environment that changes based on AR or VR mode
 function ImmersiveEnvironment() {
   const mode = useXR((state) => state.mode);
@@ -196,9 +522,83 @@ function ImmersiveEnvironment() {
   );
 }
 
+function MissionUIOverlay() {
+  const { showGForce, toggleGForce, logs, batteryDepleted } = useMissionStore();
+
+  if (batteryDepleted) return null; // hide HUD during summary
+
+  return (
+    <div className="absolute top-4 left-4 z-20 w-64 pointer-events-none">
+      {/* Logs */}
+      <div className="bg-black/60 border border-white/10 rounded-xl p-4 backdrop-blur-md mb-4 h-48 overflow-y-auto pointer-events-auto flex flex-col-reverse shadow-[0_4px_30px_rgba(0,0,0,0.5)]">
+        <div className="flex flex-col gap-2">
+          {logs.length === 0 ? (
+            <div className="text-gray-500 font-mono text-[10px]">AWAITING TELEMETRY...</div>
+          ) : (
+            logs.map((log, i) => (
+              <div key={i} className="text-neon-cyan font-mono text-[10px] opacity-80 border-l border-neon-cyan/30 pl-2">
+                {log}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+      
+      {/* Toggles */}
+      <div className="pointer-events-auto flex gap-2">
+        <button 
+          onClick={toggleGForce}
+          className={`flex-1 py-2 rounded-md font-mono text-[10px] tracking-wider transition-colors ${showGForce ? 'bg-neon-cyan/20 border border-neon-cyan/50 text-neon-cyan' : 'bg-white/5 border border-white/10 text-gray-500 hover:bg-white/10'}`}
+        >
+          {showGForce ? 'G-FORCE: ON' : 'G-FORCE: OFF'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MissionSummaryModal() {
+  const { batteryDepleted, distanceTraveled, maxSpeed, flightTime, resetMission } = useMissionStore();
+
+  if (!batteryDepleted) return null;
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+      <div className="bg-slate-900 border border-neon-orange/30 p-8 rounded-3xl max-w-sm w-full shadow-[0_0_50px_rgba(255,100,0,0.2)]">
+        <h2 className="font-display font-bold text-2xl text-white mb-2 tracking-tight">Mission Terminated</h2>
+        <div className="text-neon-orange font-mono text-xs tracking-widest mb-6">BATTERY DEPLETED</div>
+        
+        <div className="space-y-4 mb-8">
+          <div className="flex justify-between items-center border-b border-white/5 pb-2">
+            <span className="text-gray-400 font-mono text-xs">Total Flight Time</span>
+            <span className="text-white font-mono">{flightTime.toFixed(1)}s</span>
+          </div>
+          <div className="flex justify-between items-center border-b border-white/5 pb-2">
+            <span className="text-gray-400 font-mono text-xs">Distance Traveled</span>
+            <span className="text-white font-mono">{distanceTraveled.toFixed(1)}m</span>
+          </div>
+          <div className="flex justify-between items-center border-b border-white/5 pb-2">
+            <span className="text-gray-400 font-mono text-xs">Max Velocity</span>
+            <span className="text-white font-mono">{maxSpeed.toFixed(1)}m/s</span>
+          </div>
+        </div>
+        
+        <button
+          onClick={resetMission}
+          className="w-full bg-white text-black py-3 rounded-xl font-bold font-display hover:bg-gray-200 transition-colors"
+        >
+          RESTART SIMULATION
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function VRWorld() {
   return (
     <div className="w-full h-[600px] relative rounded-3xl overflow-hidden border border-white/10 bg-black/80 backdrop-blur-md shadow-[0_0_50px_rgba(0,255,200,0.1)]">
+      <MissionUIOverlay />
+      <MissionSummaryModal />
       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 flex gap-4">
         <button
           onClick={() => store.enterAR()}
@@ -217,6 +617,8 @@ export default function VRWorld() {
       <Canvas shadows camera={{ position: [0, 1.6, 4], fov: 60 }}>
         <XR store={store}>
           <ModeSwitcher />
+          <HUDOverlay />
+          <Waypoints />
           <ImmersiveEnvironment />
           
           <Physics debug={false}>
