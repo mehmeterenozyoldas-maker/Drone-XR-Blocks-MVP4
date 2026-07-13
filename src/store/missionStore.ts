@@ -14,6 +14,7 @@ export interface MissionState {
   batteryDepleted: boolean;
   setBatteryDepleted: (d: boolean) => void;
   resetMission: () => void;
+  waypoints: { x: number, y: number, z: number }[];
 }
 
 export const useMissionStore = create<MissionState>((set) => ({
@@ -34,5 +35,10 @@ export const useMissionStore = create<MissionState>((set) => ({
   addFlightTime: (t) => set((s) => ({ flightTime: s.flightTime + t })),
   batteryDepleted: false,
   setBatteryDepleted: (d) => set({ batteryDepleted: d }),
+  waypoints: [
+    { x: 10, y: 5, z: -20 },
+    { x: -15, y: 8, z: -40 },
+    { x: 5, y: 2, z: -60 }
+  ],
   resetMission: () => set({ logs: [], distanceTraveled: 0, maxSpeed: 0, flightTime: 0, batteryDepleted: false })
 }));

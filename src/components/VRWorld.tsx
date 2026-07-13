@@ -10,6 +10,105 @@ import * as THREE from 'three';
 // Configure XR Store for the application
 const store = createXRStore();
 
+// Simple singleton for drone audio synthesis
+class DroneAudioEngine {
+  ctx: AudioContext | null = null;
+  humOsc: OscillatorNode | null = null;
+  humGain: GainNode | null = null;
+  windGain: GainNode | null = null;
+  klaxonOsc: OscillatorNode | null = null;
+  klaxonGain: GainNode | null = null;
+  
+  init() {
+    if (this.ctx) return; // already initialized
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass) return;
+    
+    this.ctx = new AudioContextClass();
+    
+    // Thruster Hum
+    this.humOsc = this.ctx.createOscillator();
+    this.humGain = this.ctx.createGain();
+    this.humOsc.type = 'sawtooth';
+    this.humOsc.frequency.value = 100;
+    this.humGain.gain.value = 0;
+    
+    const humFilter = this.ctx.createBiquadFilter();
+    humFilter.type = 'lowpass';
+    humFilter.frequency.value = 800;
+
+    this.humOsc.connect(humFilter);
+    humFilter.connect(this.humGain);
+    this.humGain.connect(this.ctx.destination);
+    this.humOsc.start();
+    
+    // Wind Noise (White Noise Buffer)
+    const bufferSize = this.ctx.sampleRate * 2;
+    const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    const windNoise = this.ctx.createBufferSource();
+    windNoise.buffer = buffer;
+    windNoise.loop = true;
+    const windFilter = this.ctx.createBiquadFilter();
+    windFilter.type = 'lowpass';
+    windFilter.frequency.value = 400;
+    this.windGain = this.ctx.createGain();
+    this.windGain.gain.value = 0;
+    windNoise.connect(windFilter);
+    windFilter.connect(this.windGain);
+    this.windGain.connect(this.ctx.destination);
+    windNoise.start();
+    
+    // Battery Klaxon
+    this.klaxonOsc = this.ctx.createOscillator();
+    this.klaxonGain = this.ctx.createGain();
+    this.klaxonOsc.type = 'square';
+    this.klaxonOsc.frequency.value = 600;
+    this.klaxonGain.gain.value = 0;
+    this.klaxonOsc.connect(this.klaxonGain);
+    this.klaxonGain.connect(this.ctx.destination);
+    this.klaxonOsc.start();
+  }
+
+  update(speed: number, battery: number, isDepleted: boolean) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    
+    if (isDepleted) {
+      this.humGain?.gain.setTargetAtTime(0, t, 0.1);
+      this.windGain?.gain.setTargetAtTime(0, t, 0.1);
+      this.klaxonGain?.gain.setTargetAtTime(0, t, 0.1);
+      return;
+    }
+
+    // Thruster pitch/volume
+    if (this.humOsc && this.humGain) {
+      this.humOsc.frequency.setTargetAtTime(100 + speed * 15, t, 0.1);
+      this.humGain.gain.setTargetAtTime(0.05 + Math.min(speed * 0.015, 0.15), t, 0.1);
+    }
+    
+    // Wind noise
+    if (this.windGain) {
+      this.windGain.gain.setTargetAtTime(Math.min(speed * 0.01, 0.2), t, 0.2);
+    }
+    
+    // Klaxon (pulsing if battery < 20)
+    if (this.klaxonGain) {
+      if (battery < 20) {
+        const isPulse = Math.floor(t * 5) % 2 === 0;
+        this.klaxonGain.gain.setTargetAtTime(isPulse ? 0.05 : 0, t, 0.02);
+      } else {
+        this.klaxonGain.gain.setTargetAtTime(0, t, 0.1);
+      }
+    }
+  }
+}
+
+const droneAudio = new DroneAudioEngine();
+
 // Custom falling neon rain particles component
 function FallingRain({ count = 1200 }) {
   const pointsRef = useRef<THREE.Points>(null!);
@@ -192,6 +291,10 @@ function HUDOverlay() {
   const lastVelocityRef = useRef(new THREE.Vector3());
   const lastPositionRef = useRef(new THREE.Vector3());
   const textGForceRef = useRef<any>(null!);
+  
+  const horizonRef = useRef<THREE.Group>(null!);
+  const radarBlipsRef = useRef<THREE.Group>(null!);
+  const waypointsData = useMissionStore(s => s.waypoints);
 
   const { showGForce, addLog, addDistance, updateMaxSpeed, addFlightTime, setBatteryDepleted, batteryDepleted } = useMissionStore();
 
@@ -315,6 +418,56 @@ function HUDOverlay() {
         lastVelocityRef.current.copy(currentVel);
         lastPositionRef.current.copy(currentPos);
       }
+      
+      const currentSpeed = lastVelocityRef.current.length();
+      droneAudio.update(currentSpeed, batteryRef.current, batteryDepleted);
+
+      // --- Artificial Horizon ---
+      if (horizonRef.current) {
+        // euler.x = pitch, euler.y = yaw, euler.z = roll
+        const euler = new THREE.Euler().setFromQuaternion(activeCamera.quaternion, 'YXZ');
+        horizonRef.current.rotation.z = -euler.z; // counter roll
+        // counter pitch, limit motion so it doesn't go off screen
+        horizonRef.current.position.y = Math.max(-0.15, Math.min(0.15, euler.x * 0.2)); 
+      }
+
+      // --- 3D Radar Mini-map ---
+      if (radarBlipsRef.current) {
+        // Drone heading (yaw)
+        const droneEuler = new THREE.Euler().setFromQuaternion(activeCamera.quaternion, 'YXZ');
+        const droneYaw = droneEuler.y;
+
+        waypointsData.forEach((wp, index) => {
+          const blip = radarBlipsRef.current.children[index];
+          if (blip) {
+            // Relative position in world space
+            const dx = wp.x - activeCamera.position.x;
+            const dz = wp.z - activeCamera.position.z;
+            
+            // Rotate around Y axis to align with drone's forward direction
+            // In Three.js, positive Z is backward, so -dz is forward.
+            // Using 2D rotation matrix for yaw:
+            const cosY = Math.cos(droneYaw);
+            const sinY = Math.sin(droneYaw);
+            const localX = dx * cosY - dz * sinY;
+            const localZ = dx * sinY + dz * cosY;
+            
+            // Map to radar scale (e.g. max range 100m maps to radius 0.05m)
+            const radarScale = 0.05 / 100;
+            let blipX = localX * radarScale;
+            let blipY = -localZ * radarScale; // -localZ so that forward is UP on the radar
+
+            // Clamp to radar radius
+            const dist = Math.sqrt(blipX * blipX + blipY * blipY);
+            if (dist > 0.05) {
+               blipX = (blipX / dist) * 0.05;
+               blipY = (blipY / dist) * 0.05;
+            }
+
+            blip.position.set(blipX, blipY, 0);
+          }
+        });
+      }
     }
   });
 
@@ -436,6 +589,68 @@ function HUDOverlay() {
           <planeGeometry args={[0.005, 0.05]} />
           <meshBasicMaterial color="#00ffc8" transparent opacity={0.4} depthTest={false} />
         </mesh>
+
+        {/* Artificial Horizon Reticle */}
+        <group ref={horizonRef}>
+          {/* Left Wing */}
+          <mesh position={[-0.08, 0, 0]}>
+            <planeGeometry args={[0.06, 0.002]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+          <mesh position={[-0.11, -0.01, 0]}>
+            <planeGeometry args={[0.002, 0.02]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+          {/* Right Wing */}
+          <mesh position={[0.08, 0, 0]}>
+            <planeGeometry args={[0.06, 0.002]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+          <mesh position={[0.11, -0.01, 0]}>
+            <planeGeometry args={[0.002, 0.02]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+          {/* Center Dot */}
+          <mesh>
+            <circleGeometry args={[0.002, 8]} />
+            <meshBasicMaterial color="#ff0044" transparent opacity={0.8} depthTest={false} />
+          </mesh>
+        </group>
+
+        {/* 3D Radar Mini-map */}
+        <group position={[-0.24, -0.14, 0]}>
+          {/* Radar Background */}
+          <mesh>
+            <circleGeometry args={[0.05, 32]} />
+            <meshBasicMaterial color="#001100" transparent opacity={0.6} depthTest={false} />
+          </mesh>
+          {/* Radar Rings */}
+          <mesh>
+            <ringGeometry args={[0.024, 0.025, 32]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.3} depthTest={false} />
+          </mesh>
+          <mesh>
+            <ringGeometry args={[0.049, 0.05, 32]} />
+            <meshBasicMaterial color="#00ffc8" transparent opacity={0.5} depthTest={false} />
+          </mesh>
+          {/* Drone (Center) */}
+          <mesh>
+            <circleGeometry args={[0.002, 8]} />
+            <meshBasicMaterial color="#ffffff" depthTest={false} />
+          </mesh>
+          {/* Blips */}
+          <group ref={radarBlipsRef}>
+            {waypointsData.map((_, i) => (
+              <mesh key={i}>
+                <circleGeometry args={[0.003, 8]} />
+                <meshBasicMaterial color="#00ffc8" transparent opacity={0.8} depthTest={false} />
+              </mesh>
+            ))}
+          </group>
+          <Text position={[0, -0.06, 0]} fontSize={0.01} color="#00ffc8" anchorX="center" font="https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxTOVNp.woff" material-depthTest={false}>
+            RADAR 100M
+          </Text>
+        </group>
       </group>
     </group>
   );
@@ -443,13 +658,10 @@ function HUDOverlay() {
 
 function Waypoints() {
   const { gl, camera } = useThree();
+  const waypointsData = useMissionStore(s => s.waypoints);
   
   // List of waypoint positions
-  const waypoints = useMemo(() => [
-    new THREE.Vector3(10, 5, -20),
-    new THREE.Vector3(-15, 8, -40),
-    new THREE.Vector3(5, 2, -60),
-  ], []);
+  const waypoints = useMemo(() => waypointsData.map(w => new THREE.Vector3(w.x, w.y, w.z)), [waypointsData]);
 
   // Calculate distance from active camera to each waypoint
   const textRefs = useRef<any[]>([]);
@@ -601,13 +813,13 @@ export default function VRWorld() {
       <MissionSummaryModal />
       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 flex gap-4">
         <button
-          onClick={() => store.enterAR()}
+          onClick={() => { droneAudio.init(); store.enterAR(); }}
           className="bg-purple-600 text-white px-6 py-3 rounded-full font-bold font-mono tracking-widest hover:scale-105 transition-all hover:shadow-[0_0_30px_rgba(147,51,234,0.6)]"
         >
           ENTER XR (AR)
         </button>
         <button
-          onClick={() => store.enterVR()}
+          onClick={() => { droneAudio.init(); store.enterVR(); }}
           className="bg-neon-cyan text-black px-6 py-3 rounded-full font-bold font-mono tracking-widest hover:scale-105 transition-all hover:shadow-[0_0_30px_rgba(0,255,200,0.6)] animate-pulse"
         >
           ENTER VR (PORTAL)
